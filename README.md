@@ -32,6 +32,17 @@ MemPalace stores memories in ChromaDB (SQLite). When multiple clients write simu
     # With API key auth
     PALACE_API_KEY=your-secret python main.py
 
+
+## Security
+
+> **Do not expose port 8085 to the internet without setting .**
+> The  endpoint accepts arbitrary filesystem paths — anyone with access
+> can trigger reads from any directory on your server.
+
+For local network use, leaving auth disabled is fine. For remote access, always set an API key:
+
+    PALACE_API_KEY=your-secret python main.py
+
 ## systemd
 
     sudo cp palace-daemon.service /etc/systemd/system/

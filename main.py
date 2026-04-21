@@ -9,14 +9,13 @@ import argparse
 import asyncio
 import json
 import os
-import subprocess
 import sys
 from contextlib import asynccontextmanager
 from typing import Any
 
 import uvicorn
 from fastapi import FastAPI, Header, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 
 import mempalace.mcp_server as _mp
 
@@ -25,7 +24,7 @@ import mempalace.mcp_server as _mp
 DEFAULT_HOST = os.getenv("PALACE_HOST", "0.0.0.0")
 DEFAULT_PORT = int(os.getenv("PALACE_PORT", "8085"))
 DEFAULT_PALACE = os.getenv("PALACE_PATH", "")
-API_KEY = os.getenv("PALACE_API_KEY", "")  # empty = no auth
+API_KEY = os.getenv("PALACE_API_KEY", "")  # read at startup for argparse default; auth checks re-read from env dynamically
 
 _lock = asyncio.Lock()
 
@@ -38,7 +37,7 @@ def _check_auth(x_api_key: str | None):
 
 async def _call(request_dict: dict) -> dict:
     async with _lock:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(None, _mp.handle_request, request_dict)
         return result or {}
 
@@ -85,6 +84,7 @@ async def search(q: str, limit: int = 5, x_api_key: str | None = Header(default=
 
 @app.get("/context")
 async def context(topic: str, limit: int = 5, x_api_key: str | None = Header(default=None)):
+    # Alias for /search with a semantically friendlier name for LLM tool prompts
     _check_auth(x_api_key)
     result = await _call({
         "jsonrpc": "2.0", "id": 1,

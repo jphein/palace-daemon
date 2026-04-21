@@ -4,8 +4,11 @@ After=network.target
 
 [Service]
 Type=simple
+# EDIT: set to your username
 User=radu
+# EDIT: set to the directory where main.py lives
 WorkingDirectory=/home/radu/palace-daemon
+# EDIT: set to your mempalace venv python (find with: pipx environment --value PIPX_LOCAL_VENVS)/mempalace/bin/python
 ExecStart=/home/radu/.local/share/pipx/venvs/mempalace/bin/python main.py
 Restart=on-failure
 RestartSec=5
