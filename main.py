@@ -1,0 +1,207 @@
+"""
+palace-daemon — serializing HTTP/MCP gateway for MemPalace
+
+All ChromaDB operations are funnelled through a single asyncio.Lock()
+to prevent concurrent access corruption. This includes bulk mining jobs,
+which run as a subprocess while the lock is held.
+"""
+import argparse
+import asyncio
+import json
+import os
+import subprocess
+import sys
+from contextlib import asynccontextmanager
+from typing import Any
+
+import uvicorn
+from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import JSONResponse, StreamingResponse
+
+import mempalace.mcp_server as _mp
+
+# ── Config (env vars override CLI defaults) ───────────────────────────────────
+
+DEFAULT_HOST = os.getenv("PALACE_HOST", "0.0.0.0")
+DEFAULT_PORT = int(os.getenv("PALACE_PORT", "8085"))
+DEFAULT_PALACE = os.getenv("PALACE_PATH", "")
+API_KEY = os.getenv("PALACE_API_KEY", "")  # empty = no auth
+
+_lock = asyncio.Lock()
+
+
+def _check_auth(x_api_key: str | None):
+    key = os.getenv("PALACE_API_KEY", "")
+    if key and x_api_key != key:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+
+async def _call(request_dict: dict) -> dict:
+    async with _lock:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, _mp.handle_request, request_dict)
+        return result or {}
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
+
+
+app = FastAPI(title="palace-daemon", lifespan=lifespan)
+
+
+# ── MCP proxy ─────────────────────────────────────────────────────────────────
+
+@app.post("/mcp")
+async def mcp_proxy(request: Request, x_api_key: str | None = Header(default=None)) -> JSONResponse:
+    _check_auth(x_api_key)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    response = await _call(body)
+    return JSONResponse(content=response)
+
+
+# ── REST convenience endpoints ────────────────────────────────────────────────
+
+@app.get("/health")
+async def health():
+    result = await _call({"jsonrpc": "2.0", "id": 1, "method": "ping", "params": {}})
+    return {"status": "ok", "daemon": "palace-daemon", "palace": result}
+
+
+@app.get("/search")
+async def search(q: str, limit: int = 5, x_api_key: str | None = Header(default=None)):
+    _check_auth(x_api_key)
+    result = await _call({
+        "jsonrpc": "2.0", "id": 1,
+        "method": "tools/call",
+        "params": {"name": "mempalace_search", "arguments": {"query": q, "max_results": limit}},
+    })
+    return _unwrap(result)
+
+
+@app.get("/context")
+async def context(topic: str, limit: int = 5, x_api_key: str | None = Header(default=None)):
+    _check_auth(x_api_key)
+    result = await _call({
+        "jsonrpc": "2.0", "id": 1,
+        "method": "tools/call",
+        "params": {"name": "mempalace_search", "arguments": {"query": topic, "max_results": limit}},
+    })
+    return _unwrap(result)
+
+
+@app.post("/memory")
+async def store_memory(request: Request, x_api_key: str | None = Header(default=None)):
+    _check_auth(x_api_key)
+    body = await request.json()
+    content = body.get("content", "")
+    wing = body.get("wing", "general")
+    room = body.get("room", "notes")
+    result = await _call({
+        "jsonrpc": "2.0", "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "mempalace_add_drawer",
+            "arguments": {"wing": wing, "room": room, "content": content},
+        },
+    })
+    return _unwrap(result)
+
+
+@app.get("/stats")
+async def stats(x_api_key: str | None = Header(default=None)):
+    _check_auth(x_api_key)
+    results = {}
+    for req_id, tool in [(1, "mempalace_kg_stats"), (2, "mempalace_graph_stats"), (3, "mempalace_status")]:
+        r = await _call({
+            "jsonrpc": "2.0", "id": req_id,
+            "method": "tools/call",
+            "params": {"name": tool, "arguments": {}},
+        })
+        results[tool] = _unwrap(r)
+    return {
+        "kg": results["mempalace_kg_stats"],
+        "graph": results["mempalace_graph_stats"],
+        "status": results["mempalace_status"],
+    }
+
+
+# ── Mine endpoint (serialized bulk import) ────────────────────────────────────
+
+@app.post("/mine")
+async def mine(request: Request, x_api_key: str | None = Header(default=None)):
+    """
+    Run mempalace mine under the global lock so no daemon request can touch
+    ChromaDB while the import is in progress. The lock queues all other
+    requests for the duration of the job.
+
+    Body: { "dir": "/path/to/files", "wing": "general", "mode": "convos",
+            "extract": "exchange", "limit": 100 }
+    """
+    _check_auth(x_api_key)
+    body = await request.json()
+    directory = body.get("dir")
+    if not directory:
+        raise HTTPException(status_code=400, detail="'dir' is required")
+
+    wing = body.get("wing", "general")
+    mode = body.get("mode", "convos")
+    extract = body.get("extract")
+    limit = body.get("limit")
+
+    mempalace_bin = os.path.join(os.path.dirname(sys.executable), "mempalace")
+    cmd = [mempalace_bin, "mine", directory, "--mode", mode, "--wing", wing]
+    if extract:
+        cmd += ["--extract", extract]
+    if limit:
+        cmd += ["--limit", str(limit)]
+
+    async with _lock:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+
+    return {
+        "returncode": proc.returncode,
+        "stdout": stdout.decode(),
+        "stderr": stderr.decode(),
+    }
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _unwrap(mcp_response: dict) -> Any:
+    try:
+        text = mcp_response["result"]["content"][0]["text"]
+        return json.loads(text)
+    except (KeyError, TypeError, json.JSONDecodeError):
+        return mcp_response
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description="palace-daemon — MemPalace HTTP/MCP gateway")
+    parser.add_argument("--host", default=DEFAULT_HOST, help="Bind host (default: 0.0.0.0)")
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="Bind port (default: 8085)")
+    parser.add_argument("--palace", default=DEFAULT_PALACE, help="Palace path (overrides mempalace config)")
+    parser.add_argument("--api-key", default=API_KEY, help="API key for auth (optional)")
+    args = parser.parse_args()
+
+    if args.palace:
+        os.environ["MEMPALACE_PALACE"] = args.palace
+    if args.api_key:
+        os.environ["PALACE_API_KEY"] = args.api_key
+
+    uvicorn.run("main:app", host=args.host, port=args.port, log_level="info")
+
+
+if __name__ == "__main__":
+    main()

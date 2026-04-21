@@ -1,0 +1,16 @@
+[Unit]
+Description=palace-daemon — MemPalace HTTP/MCP gateway
+After=network.target
+
+[Service]
+Type=simple
+User=radu
+WorkingDirectory=/home/radu/palace-daemon
+ExecStart=/home/radu/.local/share/pipx/venvs/mempalace/bin/python main.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
