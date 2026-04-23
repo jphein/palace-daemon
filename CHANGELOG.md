@@ -2,12 +2,18 @@
 
 ## [1.1.2] - 2026-04-23
 
+### Added
+- `POST /backup` endpoint — performs atomic, verified SQLite backups with integrity checks
+- `POST /reload` endpoint — clears internal client cache to refresh the database index
+- Self-healing hints — the daemon now detects "Internal error: Error finding id" during searches and provides actionable advice
+
 ### Fixed
-- `palace-daemon.service` — port conflict handling: added `ExecStartPre=-/usr/bin/fuser -k 8085/tcp` to ensure port 8085 is free before starting, preventing startup failures after unclean shutdowns
+- `palace-daemon.service` — port conflict handling: added `ExecStartPre=-/usr/bin/fuser -k 8085/tcp` to ensure port 8085 is free before starting
 - Improved service reliability by adding `KillMode=mixed` to `palace-daemon.service`
+- `main.py` — added `VERSION` constant and exposed it in `/health`
 
 ### Changed
-- Updated documentation with troubleshooting for port conflicts and clearer systemd user service instructions
+- Updated documentation with API references for new endpoints and clearer systemd instructions
 
 ## [1.1.1] - 2026-04-22
 

@@ -77,7 +77,9 @@ The included `palace-daemon.service` uses `ExecStartPre=-/usr/bin/fuser -k 8085/
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| GET | /health | Daemon + palace status |
+| GET | /health | Daemon + palace status (inc. version) |
+| POST | /backup | Atomic verified SQLite backup |
+| POST | /reload | Clear client cache / refresh index |
 | GET | /stats | Wing/room counts, KG stats |
 | GET | /search?q=...&limit=5 | Semantic search |
 | GET | /context?topic=... | Same as search, named for LLM use |
