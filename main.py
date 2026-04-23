@@ -8,15 +8,18 @@ Three semaphores govern concurrency (all tunable via PALACE_MAX_CONCURRENCY):
 
 Roadmap:
   [HIGH] Verified Backups: /backup endpoint with integrity_check + smoke test retrieval.
-  [HIGH] AAAK Compaction: On-demand batch processing of raw logs into AAAK.
+  [HIGH] Stability: Auto-detect "Internal Error" during search and trigger index recovery.
+  [HIGH] Unified Routing: Ensure all clients (including miners/compactors) use the Daemon API.
   [MED]  Maintenance: Automate _READ_TOOLS sync with upstream mempalace.
 """
 import argparse
 import asyncio
 import json
 import os
+import sqlite3
 import sys
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Any
 
 import uvicorn
@@ -84,8 +87,17 @@ def _sem_for(request_dict: dict) -> asyncio.Semaphore:
 async def _call(request_dict: dict) -> dict:
     async with _sem_for(request_dict):
         loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(None, _mp.handle_request, request_dict)
-        return result or {}
+        try:
+            result = await loop.run_in_executor(None, _mp.handle_request, request_dict)
+            if result and "error" in result:
+                msg = str(result["error"].get("message", ""))
+                if "Internal error: Error finding id" in msg:
+                    # Self-healing hint: This usually means HNSW index is stale.
+                    # We don't auto-repair here as it's destructive/slow, but we tag the error.
+                    result["error"]["message"] += " (Daemon hint: HNSW index stale. Try restarting daemon or running 'mempalace repair')"
+            return result or {}
+        except Exception as e:
+            return {"jsonrpc": "2.0", "id": request_dict.get("id"), "error": {"code": -32000, "message": str(e)}}
 
 
 @asynccontextmanager
@@ -222,6 +234,65 @@ async def mine(request: Request, x_api_key: str | None = Header(default=None)):
         "stdout": stdout.decode(),
         "stderr": stderr.decode(),
     }
+
+
+@app.post("/reload")
+async def reload_palace(x_api_key: str | None = Header(default=None)):
+    """Force the daemon to reconnect to the database and refresh its index."""
+    _check_auth(x_api_key)
+    # _mp._get_client uses a cache; we clear it to force a fresh PersistentClient
+    _mp._clients.clear()
+    return {"status": "reloaded", "message": "Palace client cache cleared"}
+
+
+@app.post("/backup")
+async def create_backup(x_api_key: str | None = Header(default=None)):
+    """
+    Perform a verified atomic backup of the palace database.
+    Uses sqlite3 .backup to ensure consistency even under load.
+    """
+    _check_auth(x_api_key)
+    palace_path = _mp._config.palace_path
+    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    
+    # Create backup directory if it doesn't exist
+    backup_dir = os.path.join(os.path.dirname(palace_path), "palace.backup")
+    os.makedirs(backup_dir, exist_ok=True)
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_path = os.path.join(backup_dir, f"chroma.sqlite3.{timestamp}.bak")
+    
+    # We hold the write semaphore to ensure no daemon-driven writes happen during backup start
+    async with _write_sem:
+        try:
+            # 1. Atomic Backup
+            src = sqlite3.connect(db_path)
+            dst = sqlite3.connect(backup_path)
+            with dst:
+                src.backup(dst)
+            dst.close()
+            src.close()
+            
+            # 2. Integrity Check
+            check = sqlite3.connect(backup_path)
+            cursor = check.cursor()
+            cursor.execute("PRAGMA integrity_check;")
+            status = cursor.fetchone()[0]
+            check.close()
+            
+            if status != "ok":
+                if os.path.exists(backup_path):
+                    os.remove(backup_path)
+                raise Exception(f"Integrity check failed: {status}")
+                
+            return {
+                "status": "success",
+                "backup_file": backup_path,
+                "integrity": status,
+                "timestamp": timestamp
+            }
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Backup failed: {str(e)}")
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
