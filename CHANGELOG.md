@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.1.2] - 2026-04-23
+
+### Fixed
+- `palace-daemon.service` — port conflict handling: added `ExecStartPre=-/usr/bin/fuser -k 8085/tcp` to ensure port 8085 is free before starting, preventing startup failures after unclean shutdowns
+- Improved service reliability by adding `KillMode=mixed` to `palace-daemon.service`
+
+### Changed
+- Updated documentation with troubleshooting for port conflicts and clearer systemd user service instructions
+
+## [1.1.1] - 2026-04-22
+
+### Fixed
+- `clients/mempalace-mcp.py` — SyntaxError on startup: `--api-key` argument
+  used `default=API_KEY` before `global API_KEY` declaration; changed default
+  to `None` so the client actually starts
+
 ## [1.1.0] - 2026-04-22
 
 ### Added

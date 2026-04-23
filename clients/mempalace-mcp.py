@@ -97,11 +97,11 @@ def run_direct_mode():
 def main():
     parser = argparse.ArgumentParser(description="MCP stdio proxy for palace-daemon")
     parser.add_argument("--daemon", default=DEFAULT_DAEMON, help="palace-daemon base URL")
-    parser.add_argument("--api-key", default=API_KEY, help="API key (or set PALACE_API_KEY)")
+    parser.add_argument("--api-key", default=None, help="API key (or set PALACE_API_KEY)")
     args = parser.parse_args()
 
     global API_KEY
-    if args.api_key:
+    if args.api_key is not None:
         API_KEY = args.api_key
 
     if find_daemon(args.daemon):

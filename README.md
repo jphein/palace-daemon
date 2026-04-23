@@ -49,11 +49,29 @@ For local network use, leaving auth disabled is fine. For remote access, always 
 
 ## systemd
 
+### User service (Recommended)
+
+    mkdir -p ~/.config/systemd/user/
+    cp palace-daemon.service ~/.config/systemd/user/
+    systemctl --user daemon-reload
+    systemctl --user enable --now palace-daemon
+
+### Global service
+
     sudo cp palace-daemon.service /etc/systemd/system/
     sudo systemctl daemon-reload
     sudo systemctl enable --now palace-daemon
 
-Edit palace-daemon.service to set PALACE_API_KEY or a custom --palace path before installing.
+Edit `palace-daemon.service` to set `PALACE_API_KEY` or a custom `--palace` path before installing.
+
+## Troubleshooting
+
+### Port 8085 already in use
+If the daemon fails to start with `[Errno 98] address already in use`, it usually means a previous instance didn't shut down cleanly.
+
+The included `palace-daemon.service` uses `ExecStartPre=-/usr/bin/fuser -k 8085/tcp` to automatically clear the port before starting. If running manually, you can clear it with:
+
+    fuser -k 8085/tcp
 
 ## API
 

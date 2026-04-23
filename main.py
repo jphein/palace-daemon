@@ -19,6 +19,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 import mempalace.mcp_server as _mp
+from mempalace.backends.chroma import quarantine_stale_hnsw
 
 # ── Config (env vars override CLI defaults) ───────────────────────────────────
 
@@ -83,6 +84,13 @@ async def _call(request_dict: dict) -> dict:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    import logging
+    moved = quarantine_stale_hnsw(_mp._config.palace_path)
+    if moved:
+        logging.getLogger(__name__).warning(
+            "Quarantined %d stale HNSW segment(s) — ChromaDB will rebuild indexes: %s",
+            len(moved), moved,
+        )
     yield
 
 

@@ -8,6 +8,8 @@ Type=simple
 User=radu
 # EDIT: set to the directory where main.py lives
 WorkingDirectory=/home/radu/palace-daemon
+# Ensure the port is free before starting
+ExecStartPre=-/usr/bin/fuser -k 8085/tcp
 # EDIT: set to your mempalace venv python (find with: pipx environment --value PIPX_LOCAL_VENVS)/mempalace/bin/python
 ExecStart=/home/radu/.local/share/pipx/venvs/mempalace/bin/python main.py
 # EDIT: uncomment and tune concurrency (default: 4 reads, 2 writes)
@@ -18,6 +20,7 @@ Restart=on-failure
 RestartSec=5
 StandardOutput=journal
 StandardError=journal
+KillMode=mixed
 
 [Install]
 WantedBy=multi-user.target
