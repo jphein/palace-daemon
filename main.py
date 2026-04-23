@@ -23,6 +23,7 @@ from mempalace.backends.chroma import quarantine_stale_hnsw
 
 # ── Config (env vars override CLI defaults) ───────────────────────────────────
 
+VERSION = "1.1.2"
 DEFAULT_HOST = os.getenv("PALACE_HOST", "0.0.0.0")
 DEFAULT_PORT = int(os.getenv("PALACE_PORT", "8085"))
 DEFAULT_PALACE = os.getenv("PALACE_PATH", "")
@@ -117,7 +118,7 @@ async def health():
     # Bypass semaphores — health must respond even when all slots are busy.
     loop = asyncio.get_running_loop()
     result = await loop.run_in_executor(None, _mp.handle_request, {"jsonrpc": "2.0", "id": 1, "method": "ping", "params": {}}) or {}
-    return {"status": "ok", "daemon": "palace-daemon", "palace": result}
+    return {"status": "ok", "daemon": "palace-daemon", "version": VERSION, "palace": result}
 
 
 @app.get("/search")
