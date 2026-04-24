@@ -115,6 +115,143 @@ Pass X-Api-Key: your-secret header on all requests except /health.
 
 ## Clients
 
+### Supported tools
+
+| Tool | Config file(s) | Has hooks? |
+|---|---|---|
+| claude-code | `~/.claude.json` (mcpServers) + `~/.claude/settings.json` (hooks) | Yes (Stop, PreCompact) |
+| gemini | `~/.gemini/settings.json` | Yes (SessionStart, SessionEnd, PreCompact) |
+| vscode | `~/.vscode/mcp.json` | No |
+| cursor | `~/.cursor/mcp.json` | No |
+| jetbrains | `~/.config/JetBrains/<IDE>/mcp.json` (Linux) or `~/Library/Application Support/JetBrains/<IDE>/mcp.json` (macOS) | No |
+
+### bootstrap.sh — one-command client setup
+
+`clients/bootstrap.sh` sets up a client machine from scratch: copies `mempalace-mcp.py`
+and `hook.py` from Artemis, writes `hook_settings.json`, and patches each tool's config.
+
+**Clients do not need mempalace installed.** Both `hook.py` and `mempalace-mcp.py` are
+stdlib-only — only Artemis (the host) needs `pipx install mempalace`.
+
+```bash
+# Copy from Artemis and run
+scp radu@192.168.0.42:/home/radu/palace-daemon/clients/bootstrap.sh ~/bootstrap.sh
+
+# Wire a single tool
+bash bootstrap.sh --daemon http://192.168.0.42:8085 --tool claude-code
+
+# Wire everything
+bash bootstrap.sh --daemon http://192.168.0.42:8085 --tool all
+```
+
+`--tool` values: `claude-code` | `gemini` | `vscode` | `cursor` | `jetbrains` | `all`
+
+Files are installed to `~/.local/share/mempalace/`. After running, verify:
+
+```bash
+curl http://192.168.0.42:8085/health
+```
+
+### hook.py — stdlib hook runner
+
+`clients/hook.py` is a drop-in replacement for `mempalace hook run`. It routes all
+operations through palace-daemon instead of accessing the database directly, eliminating
+the split-brain risk that existed when `mempalace mine` was spawned as a subprocess.
+
+**Zero dependencies** — pure Python stdlib, no mempalace install needed on clients.
+
+```bash
+python3 hook.py --hook stop          --harness claude-code
+python3 hook.py --hook precompact    --harness claude-code
+python3 hook.py --hook session-start --harness codex
+```
+
+#### Behaviour by hook
+
+| Hook | What it does |
+|---|---|
+| `session-start` | Initialises state dir; passes through |
+| `stop` | Counts exchanges; at every 15th — triggers mine approval block or silent diary save depending on `silent_save` |
+| `precompact` | If `MEMPAL_DIR` set, fires `POST /mine` immediately (no approval — compaction is imminent); passes through |
+
+#### Mine routing
+
+| Old behaviour (`mempalace hook run`) | New behaviour (`hook.py`) |
+|---|---|
+| Spawns `mempalace mine` as a subprocess | Returns `decision: block` with approval prompt |
+| Falls back to transcript dir if `MEMPAL_DIR` unset | No mine triggered if `MEMPAL_DIR` unset |
+| Daemon down → still spawns subprocess | Daemon down → passes through silently |
+
+Stop hook mine approval block format:
+
+```
+AUTO-INGEST requested (MemPalace).
+Target directory: /path/to/dir
+
+Show the user this directory and ask them to approve or deny mining it into the palace.
+  Approve → POST {"dir": "/path/to/dir", "mode": "auto"} to http://localhost:8085/mine
+  Deny    → inform user, continue.
+```
+
+#### Hook settings — `~/.mempalace/hook_settings.json`
+
+| Field | Default | Description |
+|---|---|---|
+| `daemon_url` | `http://localhost:8085` | URL of palace-daemon; use the LAN IP on remote clients |
+| `silent_save` | `true` | If true, auto-saves diary entry via daemon and passes through; if false, blocks and asks the AI to save manually |
+| `desktop_toast` | `false` | Fire `notify-send` on save triggers (useful on desktops, skip on SSH) |
+
+Example (Artemis host):
+
+```json
+{
+  "silent_save": true,
+  "desktop_toast": false,
+  "daemon_url": "http://localhost:8085"
+}
+```
+
+Example (remote client pointing at Artemis):
+
+```json
+{
+  "silent_save": true,
+  "desktop_toast": false,
+  "daemon_url": "http://192.168.0.42:8085"
+}
+```
+
+#### Claude Code hook config (`~/.claude/settings.json`)
+
+```json
+{
+  "hooks": {
+    "Stop": [{"hooks": [{"type": "command",
+      "command": "python3 /path/to/hook.py --hook stop --harness claude-code",
+      "timeout": 30}]}],
+    "PreCompact": [{"hooks": [{"type": "command",
+      "command": "python3 /path/to/hook.py --hook precompact --harness claude-code",
+      "timeout": 60}]}]
+  }
+}
+```
+
+#### Gemini CLI hook config (`~/.gemini/settings.json`)
+
+```json
+{
+  "hooks": {
+    "SessionStart": [{"name": "mempalace-session-start", "type": "command",
+      "command": "python3", "args": ["/path/to/hook.py", "--hook", "session-start", "--harness", "codex"]}],
+    "SessionEnd": [{"name": "mempalace-session-stop", "type": "command",
+      "command": "python3", "args": ["/path/to/hook.py", "--hook", "stop", "--harness", "codex"]}],
+    "PreCompact": [{"name": "mempalace-precompact", "type": "command",
+      "command": "python3", "args": ["/path/to/hook.py", "--hook", "precompact", "--harness", "codex"],
+      "timeout": 30}]
+  }
+}
+```
+
 ### mempalace-mcp
 
 `clients/mempalace-mcp.py` bridges any MCP client to palace-daemon over HTTP.
@@ -129,7 +266,7 @@ Claude Code setup (`~/.claude.json` → `mcpServers`):
 {
   "mempalace": {
     "type": "stdio",
-    "command": "/path/to/venv/python",
+    "command": "python3",
     "args": ["/path/to/clients/mempalace-mcp.py", "--daemon", "http://YOUR_SERVER:8085"],
     "env": {}
   }
@@ -139,6 +276,33 @@ Claude Code setup (`~/.claude.json` → `mcpServers`):
 With API key: pass `--api-key your-secret` or set `PALACE_API_KEY` env var.
 
 **Safety First:** If the daemon is unreachable, the client will exit with an error rather than falling back to direct database access. This prevents concurrent access conflicts and ensures stability.
+
+## Testing & Development
+
+To test changes (like auto-healing or stress tests) without risking your production data or interfering with the primary daemon on port 8085, use a **Shadow Palace** via Docker.
+
+### Shadow Palace (Docker)
+
+1. **Clone your data:**
+   ```bash
+   mkdir -p ~/.mempalace/test_palace
+   cp -r ~/.mempalace/palace/* ~/.mempalace/test_palace/
+   ```
+
+2. **Run the test container:**
+   ```bash
+   docker compose -f docker-compose.test.yml up --build -d
+   ```
+
+This starts a fully isolated daemon on **port 8086** using your test data. It uses a separate lock file inside the container, ensuring it doesn't collide with your production `palace-daemon-terminal`.
+
+### Validation
+
+Check the health of your test instance:
+```bash
+curl http://localhost:8086/health
+```
+
 
 ## Architecture
 

@@ -1,5 +1,34 @@
 # Changelog
 
+## [1.4.0] - 2026-04-24
+
+### Added
+- **`clients/hook.py`** — stdlib-only hook runner replacing `mempalace hook run`. Routes all mine operations through `POST /mine` on palace-daemon; never spawns mempalace as a subprocess. If daemon is unreachable, passes through silently with no fallback to direct DB access.
+- **`clients/bootstrap.sh`** — one-command client setup script. Copies `mempalace-mcp.py` and `hook.py` from Artemis and wires them into Claude Code, Gemini CLI, VSCode, Cursor, or JetBrains. Clients need no mempalace install — both files are stdlib-only.
+- **`docs/hook-routing-fix.md`** — permanent plan document capturing the hook routing fix design, constraints, and verification steps.
+
+### Changed
+- `~/.claude/settings.json` and `~/.gemini/settings.json` hook commands updated to use `hook.py` instead of `mempalace hook run`.
+- `~/.mempalace/hook_settings.json` `daemon_url` normalised to `http://localhost:8085` (was `192.168.0.42:8085`) on Artemis.
+- `README.md` — expanded Clients section: remote client table, `hook.py` usage and behaviour, `hook_settings.json` field reference, per-tool hook configs, `bootstrap.sh` usage.
+
+### Security
+- Mine operations now require explicit user approval via block response before executing; no implicit auto-mine on session stop.
+- `MEMPAL_DIR` is the only mine trigger; transcript directory fallback removed.
+
+## [1.3.0] - 2026-04-24
+
+### Added
+- **Auto-Healing HNSW Index** — daemon now automatically detects "Internal error: Error finding id", quarantines stale index segments via `quarantine_stale_hnsw`, and retries the request seamlessly.
+- **Silent Save / Flush** — implemented automatic memory checkpointing on daemon shutdown via `lifespan` and added a manual `POST /flush` endpoint.
+- **Port-Specific Locking** — lock files are now dynamic (`/tmp/palace-daemon-{port}.lock`), allowing parallel instances (e.g., production and shadow/test palace) on the same host.
+- **Chaos Test Suite** — added `chaos_test.py` for high-concurrency validation and index corruption simulation.
+
+### Changed
+- Updated `README.md` with "Shadow Palace" testing workflow and new API endpoints.
+- Improved logging for auto-repair events to provide better visibility during recovery.
+- Bumped internal version to 1.3.0.
+
 ## [1.2.0] - 2026-04-23
 
 ### Added
