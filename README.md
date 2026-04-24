@@ -110,6 +110,9 @@ The `-` prefix means failures are ignored (i.e. if nothing is blocking, these ar
 | GET | /health | Daemon + palace status (inc. version) |
 | POST | /backup | Atomic verified SQLite backup |
 | POST | /reload | Clear client cache / refresh index |
+| POST | /repair | Coordinate repair with daemon traffic (`mode`: `light`/`scan`/`prune`/`rebuild`) |
+| GET | /repair/status | Current repair state + pending-writes queue depth |
+| POST | /silent-save | Stop-hook silent save; queues during `/repair mode=rebuild` |
 | GET | /stats | Wing/room counts, KG stats |
 | GET | /search?q=...&limit=5 | Semantic search |
 | GET | /context?topic=... | Same as search, named for LLM use |
@@ -126,6 +129,59 @@ The `-` prefix means failures are ignored (i.e. if nothing is blocking, these ar
 Body: dir (required), wing, mode (projects/convos), extract (exchange/general), limit.
 
 Mine jobs run one at a time under their own semaphore. Read and write traffic continues unblocked during a mine job.
+
+### /repair — coordinate a repair
+
+    curl -X POST http://localhost:8085/repair \
+      -H 'Content-Type: application/json' \
+      -d '{"mode": "rebuild"}'
+
+Modes:
+
+- **`light`** — clear cached client/collection; next open re-runs `quarantine_stale_hnsw()`. Fast, non-blocking for other endpoints.
+- **`scan`** — read-only inspection. Runs `mempalace.repair.scan_palace`, writes `corrupt_ids.txt` next to the palace, returns the count.
+- **`prune`** — deletes corrupt IDs via `col.delete()`. The in-library flock (`_palace_write_lock`) already serializes this against concurrent writers.
+- **`rebuild`** — destructive: `delete_collection` + `create_collection`. Those backend-level ops are **outside** the `ChromaCollection` flock, so a rebuild racing a concurrent writer silently drops writes. `/repair mode=rebuild` holds every read/write/mine semaphore slot for the rebuild window, and `/silent-save` callers queue to `<palace_parent>/palace-daemon-pending.jsonl` during this window. The queue drains automatically when the rebuild completes.
+
+Only one repair at a time. A second `/repair` call while one is in-flight returns 409.
+
+Check progress with:
+
+    curl http://localhost:8085/repair/status
+
+### /silent-save — Stop-hook save path
+
+    curl -X POST http://localhost:8085/silent-save \
+      -H 'Content-Type: application/json' \
+      -d '{
+        "session_id": "abc-123",
+        "wing": "wing_myproject",
+        "entry": "CHECKPOINT:2026-04-24|session:abc|msgs:15|recent:...",
+        "themes": ["design", "retrieval"],
+        "message_count": 15
+      }'
+
+Normal response (palace is healthy):
+
+    { "count": 15, "themes": [...], "queued": false,
+      "entry_id": "drawer_xyz",
+      "systemMessage": "✦ 15 memories woven into the palace — design, retrieval" }
+
+During `/repair mode=rebuild`:
+
+    { "count": 15, "themes": [...], "queued": true,
+      "systemMessage": "✦ 15 memories held in trust — the palace is being mended" }
+
+The `systemMessage` field is what Claude Code will render in the terminal when the hook returns it as its `systemMessage` output.
+
+#### Wiring Claude Code hooks through the daemon
+
+To have Stop-hook silent saves go through the daemon (queue-safe during repair, themed messages), set `PALACE_DAEMON_URL` (and `PALACE_API_KEY` if auth is on) in the environment the hook runs under. The fork's `mempalace/hooks_cli.py` detects these, POSTs to `/silent-save`, and emits the daemon's `systemMessage`. If the env var isn't set, or the daemon is unreachable, the hook falls through to the legacy direct-write path — no save is ever lost because the daemon happens to be down.
+
+Example env for the hook invocation (in Claude Code hooks config, or upstream of it):
+
+    PALACE_DAEMON_URL=http://localhost:8085
+    PALACE_API_KEY=your-secret     # optional, only if auth is on
 
 ### Auth
 

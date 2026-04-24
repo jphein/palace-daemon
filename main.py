@@ -16,6 +16,7 @@ Roadmap:
 import argparse
 import asyncio
 import json
+import logging
 import os
 import sqlite3
 import sys
@@ -31,11 +32,14 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 import mempalace.mcp_server as _mp
+from mempalace import repair as _mp_repair
 from mempalace.backends.chroma import quarantine_stale_hnsw
+
+import messages
 
 # ── Config (env vars override CLI defaults) ───────────────────────────────────
 
-VERSION = "1.4.2"
+VERSION = "1.5.0"
 DEFAULT_HOST = os.getenv("PALACE_HOST", "0.0.0.0")
 DEFAULT_PORT = int(os.getenv("PALACE_PORT", "8085"))
 DEFAULT_PALACE = os.getenv("PALACE_PATH", "")
@@ -49,6 +53,14 @@ PALACE_MAX_CONCURRENCY = int(os.getenv("PALACE_MAX_CONCURRENCY", "4"))
 _read_sem = asyncio.Semaphore(PALACE_MAX_CONCURRENCY)
 _write_sem = asyncio.Semaphore(max(1, PALACE_MAX_CONCURRENCY // 2))
 _mine_sem = asyncio.Semaphore(1)
+
+# Repair state — when in_progress is True, /silent-save queues instead of writing.
+# The fast-path check is lock-free (single-assignment dict); _repair_lock serializes
+# start/end transitions and prevents overlapping repairs.
+_repair_state: dict[str, Any] = {"in_progress": False, "mode": None, "started_at": None}
+_repair_lock = asyncio.Lock()
+
+_log = logging.getLogger("palace-daemon")
 
 # Tools that only read state — everything else is treated as a write.
 _READ_TOOLS = {
@@ -90,21 +102,129 @@ def _sem_for(request_dict: dict) -> asyncio.Semaphore:
 
 async def _auto_repair():
     """Trigger index recovery and reload the mempalace client."""
-    import logging
-    logger = logging.getLogger(__name__)
-    
     loop = asyncio.get_running_loop()
     palace_path = _mp._config.palace_path
     moved = await loop.run_in_executor(None, quarantine_stale_hnsw, palace_path)
     if moved:
-        logger.warning("AUTO-REPAIR: Quarantined %d stale HNSW segments. Reloading client.", len(moved))
-        # Clear client cache to force a fresh PersistentClient (which triggers rebuild)
+        _log.warning("AUTO-REPAIR: Quarantined %d stale HNSW segments. Reloading client.", len(moved))
         _mp._client_cache = None
         _mp._collection_cache = None
         return len(moved)
-    
-    logger.info("AUTO-REPAIR: No stale segments found during scan.")
+    _log.info("AUTO-REPAIR: No stale segments found during scan.")
     return 0
+
+
+# ── Exclusive palace context (for rebuild) ───────────────────────────────────
+
+@asynccontextmanager
+async def _exclusive_palace():
+    """Acquire every semaphore slot — no daemon-mediated work runs until release.
+
+    Used by /repair mode=rebuild, which deletes and recreates the collection
+    (backend-level, outside the ChromaCollection flock). Any in-flight write
+    would race with the delete/create and be lost. Holding every slot makes
+    sure nothing daemon-mediated is mid-flight when the rebuild starts.
+    """
+    read_slots = PALACE_MAX_CONCURRENCY
+    write_slots = max(1, PALACE_MAX_CONCURRENCY // 2)
+    r_held = 0
+    w_held = 0
+    m_held = False
+    try:
+        for _ in range(read_slots):
+            await _read_sem.acquire()
+            r_held += 1
+        for _ in range(write_slots):
+            await _write_sem.acquire()
+            w_held += 1
+        await _mine_sem.acquire()
+        m_held = True
+        yield
+    finally:
+        if m_held:
+            _mine_sem.release()
+        for _ in range(w_held):
+            _write_sem.release()
+        for _ in range(r_held):
+            _read_sem.release()
+
+
+# ── Pending-writes queue (held during rebuild) ───────────────────────────────
+
+def _pending_writes_path() -> str:
+    """Location of the jsonl queue that holds silent-saves during rebuild."""
+    palace_path = _mp._config.palace_path
+    parent = os.path.dirname(palace_path.rstrip("/")) or "/tmp"
+    return os.path.join(parent, "palace-daemon-pending.jsonl")
+
+
+def _enqueue_pending_write(payload: dict) -> None:
+    """Append a silent-save payload to the pending-writes queue."""
+    path = _pending_writes_path()
+    line = json.dumps({"payload": payload, "enqueued_at": datetime.now().isoformat()})
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
+
+
+async def _drain_pending_writes() -> int:
+    """Replay queued silent-saves after a rebuild completes.
+
+    Rename-then-read so a concurrent /silent-save appending after the rename
+    lands in a fresh pending file, not the one we're draining.
+    """
+    path = _pending_writes_path()
+    if not os.path.isfile(path):
+        return 0
+    proc_path = path + ".processing"
+    try:
+        os.rename(path, proc_path)
+    except OSError:
+        return 0
+    count = 0
+    try:
+        with open(proc_path, encoding="utf-8") as f:
+            lines = [ln for ln in f.readlines() if ln.strip()]
+        for line in lines:
+            try:
+                entry = json.loads(line)
+                result = await _do_silent_save_write(entry["payload"])
+                if result.get("success"):
+                    count += 1
+                else:
+                    _log.warning("drain: replay failed: %s", result.get("error"))
+            except Exception:
+                _log.exception("drain: entry replay raised")
+        os.remove(proc_path)
+    except Exception:
+        _log.exception("drain: read failed; leaving %s in place", proc_path)
+    return count
+
+
+async def _do_silent_save_write(payload: dict) -> dict:
+    """Write a diary checkpoint via tool_diary_write in an executor.
+
+    Caller is expected to hold _write_sem. Returns mempalace's raw dict
+    (typically {"success": True, "entry_id": ...} or {"success": False, "error": ...}).
+    """
+    wing = payload.get("wing", "") or ""
+    entry = payload.get("entry", "")
+    topic = payload.get("topic", "checkpoint")
+    agent_name = payload.get("agent_name", "session-hook")
+    loop = asyncio.get_running_loop()
+
+    def _work():
+        from mempalace.mcp_server import tool_diary_write
+        return tool_diary_write(
+            agent_name=agent_name,
+            entry=entry,
+            topic=topic,
+            wing=wing,
+        )
+
+    try:
+        return await loop.run_in_executor(None, _work)
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 
 async def _call(request_dict: dict, retry_on_hnsw: bool = True) -> dict:
@@ -384,6 +504,208 @@ async def mine(request: Request, x_api_key: str | None = Header(default=None)):
     }
 
 
+# ── Repair + silent-save ─────────────────────────────────────────────────────
+
+@app.post("/silent-save")
+async def silent_save(request: Request, x_api_key: str | None = Header(default=None)):
+    """
+    Silent Stop-hook save path. Writes a diary checkpoint during normal ops;
+    during /repair mode=rebuild, queues the payload to a jsonl file and
+    returns a themed "held in trust" message. The queue drains automatically
+    when the rebuild completes.
+
+    Body: {
+      session_id, wing, entry, topic?, agent_name?,
+      themes?: [...],       # for the returned systemMessage tag
+      message_count?: int,  # count the hook wants displayed (often len(messages))
+    }
+    """
+    _check_auth(x_api_key)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid JSON")
+    if not body.get("entry"):
+        raise HTTPException(status_code=400, detail="'entry' is required")
+
+    themes = body.get("themes") or []
+    msg_count = int(body.get("message_count") or 1)
+
+    # Fast-path: repair already in progress, queue immediately.
+    if _repair_state["in_progress"]:
+        _enqueue_pending_write(body)
+        return {
+            "count": msg_count,
+            "themes": themes,
+            "queued": True,
+            "systemMessage": messages.save_queued(msg_count, themes),
+        }
+
+    # Normal path: acquire write slot, re-check flag under lock, then write.
+    async with _write_sem:
+        if _repair_state["in_progress"]:
+            _enqueue_pending_write(body)
+            return {
+                "count": msg_count,
+                "themes": themes,
+                "queued": True,
+                "systemMessage": messages.save_queued(msg_count, themes),
+            }
+        result = await _do_silent_save_write(body)
+
+    if result.get("success"):
+        return {
+            "count": msg_count,
+            "themes": themes,
+            "queued": False,
+            "entry_id": result.get("entry_id"),
+            "systemMessage": messages.save_ok(msg_count, themes),
+        }
+    raise HTTPException(
+        status_code=500,
+        detail=f"silent save failed: {result.get('error', 'unknown')}",
+    )
+
+
+@app.post("/repair")
+async def repair(request: Request, x_api_key: str | None = Header(default=None)):
+    """
+    Coordinate a repair with daemon-mediated traffic.
+
+    Body: { "mode": "light" | "scan" | "prune" | "rebuild" }
+      light   — clear caches; next client open re-runs quarantine_stale_hnsw(). Cheap.
+      scan    — find corrupt IDs, write corrupt_ids.txt. Read-only.
+      prune   — delete corrupt IDs via the flock-safe col.delete path.
+      rebuild — destructive: delete + recreate the collection. Holds every
+                semaphore slot; silent-save queues during this window and
+                drains automatically on completion.
+
+    Only one repair at a time. Second call while one is in-flight → 409.
+    """
+    _check_auth(x_api_key)
+    try:
+        body = await request.json() if await request.body() else {}
+    except Exception:
+        body = {}
+    mode = (body.get("mode") or "light").lower()
+    if mode not in ("light", "scan", "prune", "rebuild"):
+        raise HTTPException(
+            status_code=400,
+            detail="mode must be one of: light, scan, prune, rebuild",
+        )
+
+    # Start transition — guarded so two /repair callers can't both begin.
+    async with _repair_lock:
+        if _repair_state["in_progress"]:
+            raise HTTPException(
+                status_code=409,
+                detail=f"repair already in progress (mode={_repair_state['mode']})",
+            )
+        _repair_state["in_progress"] = True
+        _repair_state["mode"] = mode
+        _repair_state["started_at"] = datetime.now().isoformat()
+
+    _log.info(messages.repair_begin(mode))
+    start = datetime.now()
+    result: dict[str, Any] = {}
+    drained = 0
+
+    try:
+        if mode == "light":
+            # Clear cached client + collection. Next touch will re-open and
+            # re-run quarantine_stale_hnsw() via make_client().
+            async with _write_sem:
+                _mp._client_cache = None
+                _mp._collection_cache = None
+                result = {"caches_cleared": True}
+
+        elif mode == "scan":
+            # Read-only: cap at read slot.
+            async with _read_sem:
+                loop = asyncio.get_running_loop()
+                palace_path = _mp._config.palace_path
+                await loop.run_in_executor(None, _mp_repair.scan_palace, palace_path)
+                corrupt_file = os.path.join(palace_path, "corrupt_ids.txt")
+                count = 0
+                if os.path.isfile(corrupt_file):
+                    with open(corrupt_file, encoding="utf-8") as f:
+                        count = sum(1 for ln in f if ln.strip())
+                result = {"corrupt_ids_found": count, "corrupt_file": corrupt_file}
+
+        elif mode == "prune":
+            # Takes flock internally (col.delete). Hold a single write slot so
+            # we don't inflate daemon throughput while repair is running.
+            async with _write_sem:
+                loop = asyncio.get_running_loop()
+                palace_path = _mp._config.palace_path
+                await loop.run_in_executor(
+                    None,
+                    lambda: _mp_repair.prune_corrupt(palace_path=palace_path, confirm=True),
+                )
+                result = {"pruned": True}
+            _mp._client_cache = None
+            _mp._collection_cache = None
+
+        elif mode == "rebuild":
+            # Destructive: deletes + recreates the collection. Hold every
+            # semaphore slot so no daemon-mediated write races the swap.
+            async with _exclusive_palace():
+                loop = asyncio.get_running_loop()
+                palace_path = _mp._config.palace_path
+                await loop.run_in_executor(None, _mp_repair.rebuild_index, palace_path)
+                _mp._client_cache = None
+                _mp._collection_cache = None
+                result = {"rebuilt": True}
+
+    except Exception as e:
+        _log.exception("repair (%s) failed", mode)
+        async with _repair_lock:
+            _repair_state["in_progress"] = False
+            _repair_state["mode"] = None
+            _repair_state["started_at"] = None
+        raise HTTPException(status_code=500, detail=f"repair failed: {e}")
+
+    # Clear the flag BEFORE draining so replayed silent-saves go direct,
+    # not back into the queue.
+    async with _repair_lock:
+        _repair_state["in_progress"] = False
+        _repair_state["mode"] = None
+        _repair_state["started_at"] = None
+
+    if mode == "rebuild":
+        drained = await _drain_pending_writes()
+
+    duration = (datetime.now() - start).total_seconds()
+    _log.info(messages.repair_complete(mode, drained, duration))
+    return {
+        "mode": mode,
+        "result": result,
+        "drained": drained,
+        "duration_s": round(duration, 3),
+        "systemMessage": messages.repair_complete(mode, drained, duration),
+    }
+
+
+@app.get("/repair/status")
+async def repair_status():
+    """Current repair state + pending-writes queue depth."""
+    queue_path = _pending_writes_path()
+    pending = 0
+    if os.path.isfile(queue_path):
+        try:
+            with open(queue_path, encoding="utf-8") as f:
+                pending = sum(1 for ln in f if ln.strip())
+        except OSError:
+            pending = -1
+    return {
+        "in_progress": _repair_state["in_progress"],
+        "mode": _repair_state["mode"],
+        "started_at": _repair_state["started_at"],
+        "pending_writes": pending,
+        "pending_writes_path": queue_path,
+    }
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _unwrap(mcp_response: dict) -> Any:
@@ -410,7 +732,7 @@ def main():
     args = parser.parse_args()
 
     # Simple file lock to prevent multiple daemon instances on the same port.
-    # Use ~/.cache/palace-daemon/ (mode 0o700) instead of /tmp to avoid world-writable exposure.
+    # ~/.cache/palace-daemon/ (mode 0o700) avoids world-writable /tmp exposure.
     lock_dir = Path.home() / ".cache" / "palace-daemon"
     lock_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     lock_file_path = str(lock_dir / f"daemon-{args.port}.lock")
