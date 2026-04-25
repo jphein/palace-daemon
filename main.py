@@ -466,6 +466,64 @@ def _kg_path() -> str:
     return os.path.join(_mp._config.palace_path, "knowledge_graph.sqlite3")
 
 
+def _chroma_path() -> str:
+    """Chroma sqlite path inside the palace dir."""
+    return os.path.join(_mp._config.palace_path, "chroma.sqlite3")
+
+
+def _read_wings_rooms_direct() -> tuple[dict[str, int], list[dict]]:
+    """Read wings + rooms directly from chroma.sqlite3 (read-only, off-loop).
+
+    Bypasses the MCP fan-out (list_wings + list_rooms × N) which serializes
+    through the read semaphore and stalls under load. Direct sqlite GROUP BY
+    on the embedding_metadata table is ~200× faster on the canonical 151K-
+    drawer palace (~0.4s vs 60-120s under contention) and consumes zero
+    semaphore slots.
+
+    Schema is the ChromaDB persistent client's internal layout — not part
+    of mempalace's public API. Tolerated by catching OperationalError; if
+    the schema ever drifts, /graph degrades to empty wings/rooms (the SME
+    adapter then falls back to its MCP composition path).
+    """
+    chroma = _chroma_path()
+    if not os.path.isfile(chroma):
+        return {}, []
+    try:
+        conn = sqlite3.connect(f"file:{chroma}?mode=ro", uri=True, timeout=5)
+    except sqlite3.OperationalError:
+        return {}, []
+
+    wings: dict[str, int] = {}
+    rooms_by_wing: dict[str, dict[str, int]] = {}
+    try:
+        try:
+            for name, n in conn.execute(
+                "SELECT string_value, COUNT(*) FROM embedding_metadata "
+                "WHERE key='wing' GROUP BY string_value"
+            ):
+                if name:
+                    wings[name] = n
+        except sqlite3.OperationalError:
+            pass
+        try:
+            for wing, room, n in conn.execute(
+                "SELECT em_w.string_value, em_r.string_value, COUNT(*) "
+                "FROM embedding_metadata em_w "
+                "JOIN embedding_metadata em_r ON em_w.id = em_r.id "
+                "WHERE em_w.key='wing' AND em_r.key='room' "
+                "GROUP BY em_w.string_value, em_r.string_value"
+            ):
+                if wing and room:
+                    rooms_by_wing.setdefault(wing, {})[room] = n
+        except sqlite3.OperationalError:
+            pass
+    finally:
+        conn.close()
+
+    rooms = [{"wing": w, "rooms": rooms_by_wing.get(w, {})} for w in wings]
+    return wings, rooms
+
+
 def _read_kg_direct() -> tuple[list[dict], list[dict]]:
     """Read-only snapshot of KG entities + triples.
 
@@ -545,41 +603,40 @@ async def graph(x_api_key: str | None = Header(default=None)):
             "params": {"name": tool, "arguments": args},
         }
 
-    # Phase 1: parallel-gather the once-per-palace tools.
-    # Note: tunnels come from `mempalace_graph_stats.top_tunnels` rather
-    # than `mempalace_list_tunnels`. As of mempalace 3.3.4 the two
-    # disagree on what counts as a tunnel — graph_stats reports 9 on the
-    # canonical palace, list_tunnels returns []. Until that's reconciled
-    # upstream, prefer graph_stats which `/stats` already exposes, so
-    # `/graph.tunnels` and `/stats.graph.tunnel_rooms` always agree.
-    wings_resp, graph_stats_resp, kg_stats_resp = await asyncio.gather(
-        _call(_mcp("mempalace_list_wings", {}, 1)),
-        _call(_mcp("mempalace_graph_stats", {}, 2)),
-        _call(_mcp("mempalace_kg_stats", {}, 3)),
+    # Phase 1: parallel reads.
+    #
+    # MCP path (cheap tools — graph_stats is computed in mempalace, not
+    # walked, and kg_stats is a single sqlite count): graph_stats gives us
+    # tunnels via top_tunnels (mempalace 3.3.4's mempalace_list_tunnels
+    # returns [] on palaces where graph_stats reports tunnels — bug
+    # tracked in docs/graph-endpoint.md Part 2). kg_stats gives the
+    # entities/triples summary the SME adapter already consumes.
+    #
+    # Direct sqlite path (no semaphore, ~0.4s on a 151K-drawer palace):
+    # wings, rooms-per-wing, KG entities + triples. These are the
+    # expensive parts when fanned out via MCP (list_wings is ~30s,
+    # list_rooms × N wings serializes through the 4-slot read semaphore
+    # and starves under load). Reading the underlying sqlite directly
+    # bypasses the fan-out entirely.
+    graph_stats_task = _call(_mcp("mempalace_graph_stats", {}, 1))
+    kg_stats_task    = _call(_mcp("mempalace_kg_stats",    {}, 2))
+    wings_rooms_task = asyncio.to_thread(_read_wings_rooms_direct)
+    kg_direct_task   = asyncio.to_thread(_read_kg_direct)
+
+    graph_stats_resp, kg_stats_resp, (wings, rooms), (kg_entities, kg_triples) = (
+        await asyncio.gather(
+            graph_stats_task,
+            kg_stats_task,
+            wings_rooms_task,
+            kg_direct_task,
+        )
     )
-    wings_payload = _unwrap(wings_resp) or {}
-    wings = wings_payload.get("wings") or {}
+
     graph_payload = _unwrap(graph_stats_resp) or {}
     tunnels = [
         {"room": t.get("room"), "wings": t.get("wings", [])}
         for t in (graph_payload.get("top_tunnels") or [])
     ]
-
-    # Phase 2: parallel list_rooms per wing.
-    if wings:
-        room_responses = await asyncio.gather(*[
-            _call(_mcp("mempalace_list_rooms", {"wing": w}, 100 + i))
-            for i, w in enumerate(wings)
-        ])
-        rooms = [
-            {"wing": w, "rooms": (_unwrap(r) or {}).get("rooms", {})}
-            for w, r in zip(wings, room_responses)
-        ]
-    else:
-        rooms = []
-
-    # Phase 3: KG entities + triples via direct read-only sqlite.
-    kg_entities, kg_triples = await asyncio.to_thread(_read_kg_direct)
 
     return {
         "wings": wings,
