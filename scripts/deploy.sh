@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# deploy.sh — push palace-daemon main, restart on the daemon host, smoke-test.
+#
+# Assumes:
+#   - You're committed and want to push HEAD to origin/main.
+#   - The deploy host has the repo synced (e.g., via Syncthing).
+#   - palace-daemon is a systemd --user service named "palace-daemon".
+#
+# Usage:
+#   scripts/deploy.sh                       # default host: disks
+#   PALACE_HOST=otherhost scripts/deploy.sh
+
+set -euo pipefail
+
+HOST="${PALACE_HOST:-disks}"
+URL="${PALACE_DAEMON_URL:-http://${HOST}.jphe.in:8085}"
+KEY="${PALACE_API_KEY:-}"
+
+# Fallback: read PALACE_API_KEY from ~/.claude/settings.local.json env block
+# (the source of truth managed by palace-mode).
+if [ -z "$KEY" ] && [ -f "$HOME/.claude/settings.local.json" ]; then
+    KEY=$(python3 -c "
+import json
+d = json.load(open('$HOME/.claude/settings.local.json'))
+print(d.get('env', {}).get('PALACE_API_KEY', ''))
+" 2>/dev/null || echo "")
+fi
+SYNC_GRACE="${PALACE_SYNC_GRACE:-3}"   # seconds to let Syncthing catch up
+HEALTH_TIMEOUT="${PALACE_HEALTH_TIMEOUT:-30}"
+
+step() { printf '\n\033[1m▸ %s\033[0m\n' "$1"; }
+ok()   { printf '  \033[32m✓\033[0m %s\n' "$1"; }
+fail() { printf '  \033[31m✗\033[0m %s\n' "$1" >&2; exit 1; }
+
+step "1/5  push to origin"
+local_sha=$(git rev-parse HEAD)
+git push origin main >/dev/null 2>&1 || fail "git push failed"
+ok "pushed $local_sha → origin/main"
+
+step "2/5  wait for sync to $HOST"
+sleep "$SYNC_GRACE"
+remote_sha=$(ssh "$HOST" "cd /mnt/raid/projects/palace-daemon && git rev-parse HEAD 2>/dev/null || git log -1 --format=%H 2>/dev/null" 2>/dev/null || echo "")
+if [ "$remote_sha" = "$local_sha" ]; then
+    ok "remote at $local_sha"
+elif [ -z "$remote_sha" ]; then
+    ok "remote is not a git checkout — assuming Syncthing-only mirror"
+else
+    echo "  ! remote at $remote_sha (expected $local_sha)"
+    echo "  ! Syncthing may need more time; sleeping ${SYNC_GRACE}s and retrying"
+    sleep "$SYNC_GRACE"
+    remote_sha=$(ssh "$HOST" "cd /mnt/raid/projects/palace-daemon && git rev-parse HEAD" 2>/dev/null || echo "")
+    [ "$remote_sha" = "$local_sha" ] && ok "remote caught up to $local_sha" || fail "sync lag persists; aborting"
+fi
+
+step "3/5  restart palace-daemon on $HOST"
+ssh "$HOST" "systemctl --user restart palace-daemon" || fail "restart failed"
+ok "restart issued"
+
+step "4/5  wait for daemon health"
+deadline=$((SECONDS + HEALTH_TIMEOUT))
+while (( SECONDS < deadline )); do
+    if curl -fs --max-time 3 "$URL/health" >/dev/null 2>&1; then
+        version=$(curl -s "$URL/health" | python3 -c 'import sys,json; print(json.load(sys.stdin)["version"])' 2>/dev/null || echo "?")
+        ok "healthy on v$version (after $((SECONDS - (deadline - HEALTH_TIMEOUT)))s)"
+        break
+    fi
+    sleep 1
+done
+(( SECONDS >= deadline )) && fail "daemon did not respond on $URL within ${HEALTH_TIMEOUT}s"
+
+step "5/5  smoke-test routes"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)"
+PALACE_DAEMON_URL="$URL" PALACE_API_KEY="$KEY" \
+    bash "$SCRIPT_DIR/verify-routes.sh" \
+    || fail "verify-routes reported failures (see output above)"
+
+printf '\n\033[1;32m✦ deploy complete: %s on %s\033[0m\n' "$local_sha" "$URL"
