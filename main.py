@@ -187,7 +187,7 @@ async def _exclusive_palace():
 def _pending_writes_path() -> str:
     """Location of the jsonl queue that holds silent-saves during rebuild."""
     palace_path = _mp._config.palace_path
-    parent = os.path.dirname(palace_path.rstrip("/")) or "/tmp"
+    parent = os.path.dirname(palace_path.rstrip("/")) or os.path.expanduser("~")
     return os.path.join(parent, "palace-daemon-pending.jsonl")
 
 
@@ -602,25 +602,9 @@ async def silent_save(request: Request, x_api_key: str | None = Header(default=N
         if msg_count <= 0:
             msg_count = 1
 
+    # Acquire write slot, check rebuild flag under lock, then write or queue.
     # Queue only when /repair is doing a rebuild — other modes (light/scan/
-    # prune) don't replace the collection out from under in-flight writes,
-    # so silent-saves can proceed normally.
-    queue_writes = (
-        _repair_state["in_progress"]
-        and _repair_state.get("mode") == "rebuild"
-    )
-
-    # Fast-path: rebuild in progress, queue immediately.
-    if queue_writes:
-        await _enqueue_pending_write(body)
-        return {
-            "count": msg_count,
-            "themes": themes,
-            "queued": True,
-            "systemMessage": messages.save_queued(msg_count, themes),
-        }
-
-    # Normal path: acquire write slot, re-check flag under lock, then write.
+    # prune) don't replace the collection out from under in-flight writes.
     async with _write_sem:
         if (
             _repair_state["in_progress"]
