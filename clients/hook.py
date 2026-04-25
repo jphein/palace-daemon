@@ -36,6 +36,7 @@ from pathlib import Path
 SAVE_INTERVAL = 15           # count-based: save every N exchanges
 TIME_SAVE_INTERVAL = 300     # time-based: save if this many seconds elapsed with unsaved exchanges
 FORCE_MIN_INTERVAL = 60      # force_on_stop: minimum seconds between saves (prevents per-response spam)
+CHECKPOINT_TOPIC = "checkpoint"  # keep in sync with main.py and mempal-fast.py — used by kind= search filter
 STATE_DIR = Path.home() / ".mempalace" / "hook_state"
 HOOK_SETTINGS_PATH = Path.home() / ".mempalace" / "hook_settings.json"
 
@@ -340,7 +341,7 @@ def hook_stop(data: dict, harness: str):
         ok = _post_mcp(daemon_url, "mempalace_diary_write", {
             "agent_name": harness,
             "entry": entry,
-            "topic": "auto-save",
+            "topic": CHECKPOINT_TOPIC,
         })
         _log(f"Silent save {'OK' if ok else 'FAILED (daemon unreachable)'} at exchange {exchange_count}")
         if toast:
