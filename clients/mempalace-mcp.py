@@ -55,7 +55,16 @@ def forward(url: str, request: dict) -> dict:
     # 120s headroom for slow read tools (e.g. mempalace_status walking a
     # multi-GB palace) plus short waits behind in-flight writes on the
     # daemon's read semaphore. Override with PALACE_MCP_TIMEOUT for tuning.
-    timeout = int(os.getenv("PALACE_MCP_TIMEOUT", "120"))
+    raw_timeout = os.getenv("PALACE_MCP_TIMEOUT", "120")
+    try:
+        timeout = int(raw_timeout)
+    except ValueError:
+        print(
+            f"warning: PALACE_MCP_TIMEOUT='{raw_timeout}' is not an integer; "
+            "falling back to 120s",
+            file=sys.stderr,
+        )
+        timeout = 120
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read())
 

@@ -158,19 +158,26 @@ def _pending_writes_path() -> str:
     return os.path.join(parent, "palace-daemon-pending.jsonl")
 
 
-def _enqueue_pending_write(payload: dict) -> None:
-    """Append a silent-save payload to the pending-writes queue."""
+async def _enqueue_pending_write(payload: dict) -> None:
+    """Append a silent-save payload to the pending-writes queue (off-loop)."""
     path = _pending_writes_path()
     line = json.dumps({"payload": payload, "enqueued_at": datetime.now().isoformat()})
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(line + "\n")
+
+    def _append():
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+
+    await asyncio.to_thread(_append)
 
 
 async def _drain_pending_writes() -> int:
     """Replay queued silent-saves after a rebuild completes.
 
     Rename-then-read so a concurrent /silent-save appending after the rename
-    lands in a fresh pending file, not the one we're draining.
+    lands in a fresh pending file, not the one we're draining. Each entry is
+    replayed under _write_sem to honour _do_silent_save_write's contract.
+    Failed entries are quarantined to a timestamped file so the next drain
+    pass doesn't replay successful saves.
     """
     path = _pending_writes_path()
     if not os.path.isfile(path):
@@ -181,19 +188,28 @@ async def _drain_pending_writes() -> int:
     except OSError:
         return 0
     count = 0
+    failed_lines: list[str] = []
     try:
         with open(proc_path, encoding="utf-8") as f:
             lines = [ln for ln in f.readlines() if ln.strip()]
         for line in lines:
             try:
                 entry = json.loads(line)
-                result = await _do_silent_save_write(entry["payload"])
+                async with _write_sem:
+                    result = await _do_silent_save_write(entry["payload"])
                 if result.get("success"):
                     count += 1
                 else:
                     _log.warning("drain: replay failed: %s", result.get("error"))
+                    failed_lines.append(line)
             except Exception:
                 _log.exception("drain: entry replay raised")
+                failed_lines.append(line)
+        if failed_lines:
+            qpath = proc_path + ".failed-" + datetime.now().strftime("%Y%m%d%H%M%S")
+            with open(qpath, "w", encoding="utf-8") as f:
+                f.writelines(failed_lines)
+            _log.warning("drain: %d entries quarantined at %s", len(failed_lines), qpath)
         os.remove(proc_path)
     except Exception:
         _log.exception("drain: read failed; leaving %s in place", proc_path)
@@ -273,7 +289,7 @@ async def lifespan(app: FastAPI):
     # occasionally segfaults on the very first request if opened cold; opening
     # it here (before yield) ensures the PersistentClient is fully initialized.
     try:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, _mp.handle_request, {
             "jsonrpc": "2.0", "id": "warmup", "method": "ping", "params": {}
         })
@@ -537,11 +553,31 @@ async def silent_save(request: Request, x_api_key: str | None = Header(default=N
         raise HTTPException(status_code=400, detail="'entry' is required")
 
     themes = body.get("themes") or []
-    msg_count = int(body.get("message_count") or 1)
+    raw_msg_count = body.get("message_count")
+    if raw_msg_count is None:
+        msg_count = 1
+    else:
+        try:
+            msg_count = int(raw_msg_count)
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=400,
+                detail="'message_count' must be an integer",
+            )
+        if msg_count <= 0:
+            msg_count = 1
 
-    # Fast-path: repair already in progress, queue immediately.
-    if _repair_state["in_progress"]:
-        _enqueue_pending_write(body)
+    # Queue only when /repair is doing a rebuild — other modes (light/scan/
+    # prune) don't replace the collection out from under in-flight writes,
+    # so silent-saves can proceed normally.
+    queue_writes = (
+        _repair_state["in_progress"]
+        and _repair_state.get("mode") == "rebuild"
+    )
+
+    # Fast-path: rebuild in progress, queue immediately.
+    if queue_writes:
+        await _enqueue_pending_write(body)
         return {
             "count": msg_count,
             "themes": themes,
@@ -551,8 +587,11 @@ async def silent_save(request: Request, x_api_key: str | None = Header(default=N
 
     # Normal path: acquire write slot, re-check flag under lock, then write.
     async with _write_sem:
-        if _repair_state["in_progress"]:
-            _enqueue_pending_write(body)
+        if (
+            _repair_state["in_progress"]
+            and _repair_state.get("mode") == "rebuild"
+        ):
+            await _enqueue_pending_write(body)
             return {
                 "count": msg_count,
                 "themes": themes,
