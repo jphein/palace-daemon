@@ -33,21 +33,28 @@ from fastapi.responses import JSONResponse
 import mempalace.mcp_server as _mp
 from mempalace.backends.chroma import quarantine_stale_hnsw
 
+import logging
+_log = logging.getLogger("palace-daemon")
+
 # ── Config (env vars override CLI defaults) ───────────────────────────────────
 
-VERSION = "1.4.2"
+VERSION = "1.4.4"
 DEFAULT_HOST = os.getenv("PALACE_HOST", "0.0.0.0")
 DEFAULT_PORT = int(os.getenv("PALACE_PORT", "8085"))
 DEFAULT_PALACE = os.getenv("PALACE_PATH", "")
 API_KEY = os.getenv("PALACE_API_KEY", "")  # read at startup for argparse default; auth checks re-read from env dynamically
 PALACE_MAX_CONCURRENCY = int(os.getenv("PALACE_MAX_CONCURRENCY", "4"))
+PALACE_MAX_READ_CONCURRENCY = int(os.getenv("PALACE_MAX_READ_CONCURRENCY", str(PALACE_MAX_CONCURRENCY)))
+PALACE_MAX_WRITE_CONCURRENCY = int(os.getenv("PALACE_MAX_WRITE_CONCURRENCY", str(max(1, PALACE_MAX_CONCURRENCY // 2))))
 
-# Read ops: up to N concurrent.
-# Regular write ops: up to N//2 concurrent (mempalace ≥3.3.2 is internally safe).
+# Read ops: up to PALACE_MAX_READ_CONCURRENCY concurrent.
+# Write ops: up to PALACE_MAX_WRITE_CONCURRENCY concurrent.
+# Set PALACE_MAX_WRITE_CONCURRENCY=1 to serialise writes (mitigates MemPalace
+# issue #1161 — HNSW num_threads not persisted in ChromaDB 1.5.x).
 # Mine jobs: exclusive semaphore independent of reads/writes so a long mine
 # doesn't starve normal traffic.
-_read_sem = asyncio.Semaphore(PALACE_MAX_CONCURRENCY)
-_write_sem = asyncio.Semaphore(max(1, PALACE_MAX_CONCURRENCY // 2))
+_read_sem = asyncio.Semaphore(PALACE_MAX_READ_CONCURRENCY)
+_write_sem = asyncio.Semaphore(PALACE_MAX_WRITE_CONCURRENCY)
 _mine_sem = asyncio.Semaphore(1)
 
 # Tools that only read state — everything else is treated as a write.
@@ -88,22 +95,45 @@ def _sem_for(request_dict: dict) -> asyncio.Semaphore:
     return _read_sem if tool_name in _READ_TOOLS else _write_sem
 
 
+async def _warn_if_hnsw_threads_unset() -> None:
+    """Warn if hnsw:num_threads != 1 after a collection reopen.
+
+    ChromaDB 1.5.x does not persist HNSW metadata across reopens (MemPalace
+    issue #1161). After any cache clear the collection silently reverts to
+    parallel inserts, risking SIGSEGV under concurrent writes.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _mp.handle_request, {
+            "jsonrpc": "2.0", "id": "hnsw-check", "method": "ping", "params": {}
+        })
+        col = _mp._collection_cache
+        meta = (col and getattr(col, "_collection", None) and
+                getattr(col._collection, "metadata", None)) or {}
+        threads = meta.get("hnsw:num_threads")
+        if threads != 1:
+            _log.warning(
+                "HNSW num_threads=%s after collection reopen — parallel inserts active. "
+                "Concurrent writes risk SIGSEGV. See MemPalace issue #1161. "
+                "Upgrade to mempalace >=3.3.4 when available.",
+                threads,
+            )
+    except Exception:
+        pass
+
+
 async def _auto_repair():
     """Trigger index recovery and reload the mempalace client."""
-    import logging
-    logger = logging.getLogger(__name__)
-    
     loop = asyncio.get_running_loop()
     palace_path = _mp._config.palace_path
     moved = await loop.run_in_executor(None, quarantine_stale_hnsw, palace_path)
     if moved:
-        logger.warning("AUTO-REPAIR: Quarantined %d stale HNSW segments. Reloading client.", len(moved))
-        # Clear client cache to force a fresh PersistentClient (which triggers rebuild)
+        _log.warning("AUTO-REPAIR: Quarantined %d stale HNSW segments. Reloading client.", len(moved))
         _mp._client_cache = None
         _mp._collection_cache = None
+        await _warn_if_hnsw_threads_unset()
         return len(moved)
-    
-    logger.info("AUTO-REPAIR: No stale segments found during scan.")
+    _log.info("AUTO-REPAIR: No stale segments found during scan.")
     return 0
 
 
@@ -152,7 +182,9 @@ async def lifespan(app: FastAPI):
             "Quarantined %d stale HNSW segment(s) — ChromaDB will rebuild indexes: %s",
             len(moved), moved,
         )
-    
+
+    await _warn_if_hnsw_threads_unset()
+
     yield
     
     # --- Shutdown: Silent Save / Flush ---
@@ -400,6 +432,16 @@ def _unwrap(mcp_response: dict) -> Any:
 _lock_file = None
 
 
+def _clear_port(port: int):
+    """Attempt to kill any process currently holding the target port."""
+    import subprocess
+    try:
+        # Use fuser to kill the process on the port.
+        subprocess.run(["fuser", "-k", f"{port}/tcp"], capture_output=True)
+    except Exception:
+        pass
+
+
 def main():
     global _lock_file
     parser = argparse.ArgumentParser(description="palace-daemon — MemPalace HTTP/MCP gateway")
@@ -407,13 +449,22 @@ def main():
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="Bind port (default: 8085)")
     parser.add_argument("--palace", default=DEFAULT_PALACE, help="Palace path (overrides mempalace config)")
     parser.add_argument("--api-key", default=API_KEY, help="API key for auth (optional)")
+    parser.add_argument("--force", action="store_true", help="Force clear port before starting (used by systemd)")
+    parser.add_argument("--manual", action="store_true", help="Allow manual start outside of systemd")
     args = parser.parse_args()
 
+    # Prevent accidental manual starts by agents
+    if not os.getenv("INVOCATION_ID") and not args.manual:
+        print("ERROR: Manual startup detected. Use 'sudo systemctl start palace-daemon' instead.")
+        print("If you MUST run manually for debugging, use the --manual flag.")
+        sys.exit(1)
+
+    if args.force:
+        _clear_port(args.port)
+
     # Simple file lock to prevent multiple daemon instances on the same port.
-    # Use ~/.cache/palace-daemon/ (mode 0o700) instead of /tmp to avoid world-writable exposure.
-    lock_dir = Path.home() / ".cache" / "palace-daemon"
-    lock_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    lock_file_path = str(lock_dir / f"daemon-{args.port}.lock")
+    # Use /tmp for a global lock that prevents system vs user service conflicts.
+    lock_file_path = f"/tmp/palace-daemon-{args.port}.lock"
     _lock_file = open(lock_file_path, "w")
     try:
         fcntl.lockf(_lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)

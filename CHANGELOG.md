@@ -1,5 +1,23 @@
 # Changelog
 
+## [1.4.4] - 2026-04-25
+
+### Added
+- **Docker support** — `Dockerfile`, `docker-compose.yml`, and `.dockerignore` for containerised testing and distribution. Mount your palace as a volume (`-v ~/.mempalace/palace:/palace`); palace data is never baked into the image.
+- **HNSW thread monitor** — `_warn_if_hnsw_threads_unset()` fires on daemon startup and after every cache clear. Logs a `WARNING` if `hnsw:num_threads` is not set to 1 on the reopened collection, exposing the ChromaDB 1.5.x persistence gap described in MemPalace issue #1161. Warning goes silent automatically once MemPalace ≥3.3.4 ships the runtime fix.
+- **Module-level logger** — `_log = logging.getLogger("palace-daemon")` replaces per-function `import logging` / local `logger` instances throughout `main.py`.
+
+### Changed
+- **Granular concurrency env vars** — `PALACE_MAX_CONCURRENCY` is now a shared default only. Two new vars allow independent tuning:
+  - `PALACE_MAX_READ_CONCURRENCY` (default: `PALACE_MAX_CONCURRENCY`) — concurrent read slots
+  - `PALACE_MAX_WRITE_CONCURRENCY` (default: `PALACE_MAX_CONCURRENCY // 2`) — concurrent write slots
+  - `palace-daemon.service` now sets `PALACE_MAX_READ_CONCURRENCY=4` and `PALACE_MAX_WRITE_CONCURRENCY=1` as a mitigation for the MemPalace #1161 HNSW race until ≥3.3.4 is available.
+
+## [1.4.3] - 2026-04-24
+
+### Fixed
+- **Gemini CLI hook event name** — corrected hook event from `PreCompact` to `PreCompress` in `README.md` and `docs/hook-routing-fix.md` to match Gemini CLI's actual event name (Claude Code uses `PreCompact`; Gemini CLI uses `PreCompress`).
+
 ## [1.4.2] - 2026-04-24
 
 ### Fixed
