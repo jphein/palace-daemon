@@ -34,6 +34,13 @@ SAVE_INTERVAL = 15
 STATE_DIR = Path.home() / ".mempalace" / "hook_state"
 HOOK_SETTINGS_PATH = Path.home() / ".mempalace" / "hook_settings.json"
 
+# Canonical topic name for Stop-hook auto-save checkpoint diary entries.
+# Defined as a constant so all hook code paths agree on the string value
+# used downstream by mempalace.searcher.build_where_filter for kind=
+# filtering (jphein/mempalace fork-ahead row 21, 2026-04-25). Keep in
+# sync with mempal-fast.py and mempalace.hooks_cli.
+CHECKPOINT_TOPIC = "checkpoint"
+
 SUPPORTED_HARNESSES = {"claude-code", "codex", "gemini-cli"}
 
 STOP_BLOCK_REASON = (
@@ -285,7 +292,7 @@ def hook_stop(data: dict, harness: str):
         ok = _post_mcp(daemon_url, "mempalace_diary_write", {
             "agent_name": harness,
             "entry": entry,
-            "topic": "auto-save",
+            "topic": CHECKPOINT_TOPIC,
         })
         _log(f"Silent save {'OK' if ok else 'FAILED (daemon unreachable)'} at exchange {exchange_count}")
         if toast:

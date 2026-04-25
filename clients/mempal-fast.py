@@ -7,6 +7,12 @@ from pathlib import Path
 SAVE_INTERVAL = 15
 STATE_DIR = Path.home() / ".mempalace" / "hook_state"
 
+# Canonical topic name for Stop-hook auto-save checkpoint diary entries.
+# All hook clients (this fast-path, hook.py, mempalace.hooks_cli) must
+# write the same value so jphein/mempalace's search kind= filter
+# (default kind="content") cleanly excludes them.
+CHECKPOINT_TOPIC = "checkpoint"
+
 
 def log(msg):
     try:
@@ -91,7 +97,7 @@ def main():
         "session_id": session_id,
         "wing": wing_from_path(transcript_path),
         "entry": f"Stop checkpoint at {count} exchanges",
-        "topic": "checkpoint",
+        "topic": CHECKPOINT_TOPIC,
         "agent_name": "session-hook",
         "themes": [],
         "message_count": since_last,
