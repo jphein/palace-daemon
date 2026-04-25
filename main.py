@@ -412,7 +412,10 @@ async def store_memory(request: Request, x_api_key: str | None = Header(default=
             "arguments": {"wing": wing, "room": room, "content": content},
         },
     })
-    return _unwrap(result)
+    unwrapped = _unwrap(result)
+    if isinstance(unwrapped, dict) and unwrapped.get('success'):
+        unwrapped['toast'] = f'Filed to {wing}/{room}'
+    return unwrapped
 
 
 @app.get("/stats")
@@ -625,6 +628,7 @@ async def silent_save(request: Request, x_api_key: str | None = Header(default=N
             "themes": themes,
             "queued": False,
             "entry_id": result.get("entry_id"),
+            "toast": f"Palace updated: {msg_count} msgs saved ({themes[0] if themes else "checkpoint"})",
             "systemMessage": messages.save_ok(msg_count, themes),
         }
     raise HTTPException(
