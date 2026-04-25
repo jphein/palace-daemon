@@ -10,3 +10,4 @@ mempalace.yaml
 entities.json
 *.log
 .env
+venv/

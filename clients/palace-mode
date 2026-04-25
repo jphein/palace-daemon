@@ -7,6 +7,11 @@
 #   palace-mode remote [URL]    # switch hooks/MCP to daemon (default URL)
 #   palace-mode install         # re-apply all customizations (run after plugin updates)
 #   palace-mode verify          # check that all customizations are in place
+#
+# Scope: this tool installs customizations into the Claude Code plugin
+# cache only (~/.claude/plugins/cache/mempalace/...). It deliberately does
+# not modify any plugin source/dev clone the user might have under
+# ~/Projects/, so git status on those clones stays clean.
 
 set -euo pipefail
 
@@ -21,7 +26,6 @@ FAST="$CLIENTS_DIR/mempal-fast.py"
 
 # Auto-discover the latest installed mempalace plugin in the cache.
 PLUGIN_CACHE_DIR="$(ls -1d "$HOME"/.claude/plugins/cache/mempalace/mempalace/*/ 2>/dev/null | sort -V | tail -1 | sed 's:/$::')"
-WORKSPACE_DIR="$HOME/Projects/memorypalace/.claude-plugin"
 
 # ------------------------------------------------------------------ helpers
 
@@ -107,8 +111,7 @@ do_install() {
     install_cache_plugin_json
     install_cache_hooks_json
     install_wrappers "$PLUGIN_CACHE_DIR/hooks"
-    install_wrappers "$WORKSPACE_DIR/hooks"
-    echo "→ installed customizations into cache + workspace"
+    echo "→ installed customizations into plugin cache"
 }
 
 # ------------------------------------------------------------------ verify
@@ -127,10 +130,6 @@ verify() {
     check_grep "$PLUGIN_CACHE_DIR/plugin.json" "palace-mcp-dispatch.sh"
     check_grep "$PLUGIN_CACHE_DIR/hooks/mempal-stop-hook.sh" "mempal-fast.py"
     check_grep "$PLUGIN_CACHE_DIR/hooks/mempal-precompact-hook.sh" "mempal-fast.py"
-
-    echo "workspace:"
-    check_grep "$WORKSPACE_DIR/hooks/mempal-stop-hook.sh" "mempal-fast.py"
-    check_grep "$WORKSPACE_DIR/hooks/mempal-precompact-hook.sh" "mempal-fast.py"
 
     [ $fail -eq 0 ] && echo "ALL OK" || { echo "FAILED — run: palace-mode install" >&2; exit 1; }
 }
