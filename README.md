@@ -114,11 +114,25 @@ The `-` prefix means failures are ignored (i.e. if nothing is blocking, these ar
 | GET | /repair/status | Current repair state + pending-writes queue depth |
 | POST | /silent-save | Stop-hook silent save; queues during `/repair mode=rebuild` |
 | GET | /stats | Wing/room counts, KG stats |
-| GET | /search?q=...&limit=5 | Semantic search |
-| GET | /context?topic=... | Same as search, named for LLM use |
+| GET | /search?q=...&limit=5&kind=content | Semantic search. `kind` ∈ {content, checkpoint, all} — see below. |
+| GET | /context?topic=...&kind=content | Same as search, named for LLM use |
 | POST | /memory | Store a drawer {content, wing, room} |
 | POST | /mcp | Full MCP JSON-RPC proxy |
 | POST | /mine | Bulk import under lock |
+
+### /search — `kind=` filter (v1.5.1+)
+
+The `kind` query param controls what shape of drawer the daemon returns. It mirrors the `kind` parameter on jphein/mempalace's `mempalace_search` MCP tool (fork commit `8d02835`).
+
+| Value | Returns | When to use |
+|---|---|---|
+| `content` (default) | Substantive drawers; excludes Stop-hook auto-save checkpoints | Almost always — the right answer for retrieval-then-grounding |
+| `checkpoint` | Only Stop-hook checkpoints | Session recovery, hook debugging, audit |
+| `all` | No filter | When you genuinely need every drawer (rare; pre-2026-04-25 behavior) |
+
+Why default to excluding checkpoints? Stop-hook diary entries (`topic=checkpoint`, text starting `"CHECKPOINT:"`) are short word-dense session summaries that consistently outrank substantive content under cosine similarity — by drawer count they're a small fraction of the corpus, but they routinely make up 80%+ of search results. Validated 2026-04-25 on a 151K-drawer palace: same query returned 5 CHECKPOINTs with `kind=all` vs. 5 substantive content drawers with `kind=content`.
+
+Invalid values return `400 Bad Request`. The daemon also canonicalizes the `topic` field at `/silent-save`: legacy synonyms like `"auto-save"` are rewritten to `"checkpoint"` so the read-side filter works regardless of which client wrote the entry.
 
 ### /mine — bulk import
 

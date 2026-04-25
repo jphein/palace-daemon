@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.5.1] - 2026-04-25
+
+### Added
+- **`/search` and `/context` accept `kind=` query param** mirroring the `mempalace_search` MCP tool's input_schema enum. Three values: `content` (default, excludes Stop-hook auto-save checkpoints), `checkpoint` (only checkpoints, recovery/audit), `all` (no filter, pre-2026-04-25 behavior). Backed by jphein/mempalace commit `8d02835`'s read-side filter. End-to-end validated against the 151K-drawer canonical palace: same query returned 5 CHECKPOINT-shaped diary entries with `kind=all` vs. 5 substantive content drawers with `kind=content`. Invalid values return 400.
+- **`_canonical_topic()` helper** in `_silent_save_write`. Rewrites legacy synonyms (currently `"auto-save"` → `"checkpoint"`) at the daemon boundary with a warning log line, so client-side topic drift can't silently leak into palace metadata. Defense-in-depth on top of the per-client canonical-topic constants in `clients/hook.py` and `clients/mempal-fast.py`.
+- **`scripts/verify-routes.sh`** — curl-based smoke test that exercises every public route post-deploy. Designed for manual `systemctl --user restart palace-daemon` validation, not CI (depends on a live palace).
+
+### Fixed
+- **`/search` and `/context` now actually honor `limit=`.** Earlier versions passed `max_results` to the `mempalace_search` MCP tool, but the tool's input_schema declares `limit` — `mempalace.mcp_server.handle_request` then silently dropped the unknown key via its schema-property whitelist (line 1677), and *every* response was capped at the default 5 regardless of what the user asked for. Confirmed against running v1.5.0. Renamed to `limit` so the user-supplied value actually binds.
+
+### Notes
+- The `/search` filter is a daemon-side wrapper around the read-side filter that lives in `mempalace.searcher`. It works because the daemon imports the fork's mempalace at `/mnt/raid/projects/memorypalace`. Upstream MemPalace doesn't have the `kind=` parameter on `mempalace_search` yet — fork PR pending. Until that lands, this daemon needs the fork checked out as its mempalace install.
+
 ## [1.5.0] - 2026-04-24
 
 ### Added
