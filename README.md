@@ -191,8 +191,8 @@ python3 hook.py --hook session-start --harness codex
 
 | Hook | What it does |
 |---|---|
-| `session-start` | Initialises state dir; passes through |
-| `stop` | Counts exchanges; at every 15th — triggers mine approval block or silent diary save depending on `silent_save` |
+| `session-start` | Initialises state dir; seeds the per-session save timestamp; prunes state files older than 7 days |
+| `stop` | Three independent save triggers (any one fires): **count** — every 15 exchanges; **time** — every 5 min with unsaved exchanges; **force** — `force_on_stop=true` saves whenever any exchanges are unsaved and ≥`force_min_interval` s have passed (catches short session-end stops). Triggers mine approval block or silent diary save depending on `silent_save`. |
 | `precompact` | If `MEMPAL_DIR` set, fires `POST /mine` immediately (no approval — compaction is imminent); passes through |
 
 #### Mine routing
@@ -221,6 +221,8 @@ Show the user this directory and ask them to approve or deny mining it into the 
 | `daemon_url` | `http://localhost:8085` | URL of palace-daemon; use the LAN IP on remote clients |
 | `silent_save` | `true` | If true, auto-saves diary entry via daemon and passes through; if false, blocks and asks the AI to save manually |
 | `desktop_toast` | `false` | Fire `notify-send` on save triggers (useful on desktops, skip on SSH) |
+| `force_on_stop` | `true` | Save on every Stop where unsaved exchanges exist and ≥`force_min_interval` s have passed — ensures session-end stops are never missed |
+| `force_min_interval` | `60` | Minimum seconds between `force_on_stop` saves; prevents a diary write after every single response |
 
 Example (Artemis host):
 
