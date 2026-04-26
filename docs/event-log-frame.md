@@ -67,6 +67,7 @@ system, but it leaves the frame implicit.
 | `GET /context` | Query the **semantic-search view**, formatted for LLM prompts. |
 | `GET /stats` | Aggregate query across multiple views (KG, graph stats, status). |
 | `GET /graph` | Compose a snapshot across multiple views (wings, rooms, KG, tunnels) for SME-style consumers. |
+| `GET /viz` | Render the snapshot as an HTML page — multi-view inspector for humans (D3 force-graph + Mermaid hierarchy + bar charts) over the same `/graph` data. |
 | `POST /repair mode=light` | Invalidate cached view handles; next read re-opens. |
 | `POST /repair mode=scan` | Read-only audit of view consistency. |
 | `POST /repair mode=prune` | Remove corrupt rows from the view's underlying storage. |
