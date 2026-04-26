@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.7.0] - 2026-04-26
+
+### Added
+- **`GET /viz`** — self-contained status dashboard. Single HTML page that fetches `/graph`, `/repair/status`, and `/health` in parallel and renders five panels: status strip (version, drawer count, repair pulse, pending writes), D3 force-directed knowledge graph, wing/room hierarchy (Mermaid tree), wings bar chart, tunnels list with click-to-highlight. D3 + Mermaid loaded via CDN, no static-file deps. Optional `?refresh=N` for auto-refresh, `?key=…` for ergonomic auth bookmarking.
+- Inspired by upstream MemPalace PRs #1022 (sangeethkc — D3 KG viz), #393 (jravas — Mermaid diagrams), #431 (MiloszPodsiadly — CLI stats), #256 (rusel95 — sync_status MCP), #601 (mvanhorn — brief overview). None cherry-picked; the page consumes the daemon's own `/graph` endpoint so it benefits from the direct-sqlite optimization (sub-second on 151K drawers) and stays decoupled from upstream's evolution.
+- Security: all wing/room/entity names from `/graph` enter the DOM via `textContent` / safe `setAttribute`, never `innerHTML`. Mermaid labels pass through a `_/` sanitizer that strips `[`, `]`, `"`, `<`, `>`, `|`, `` ` `` to avoid breaking the parser. CDN-loaded D3 + Mermaid are the only third-party scripts.
+- HTML template at `static/viz.html`; cached at module load. New endpoint defined alongside `/graph` in `main.py`.
+- Added `GET /viz` probe to `scripts/verify-routes.sh`.
+
 ## [1.6.0] - 2026-04-25
 
 ### Added
