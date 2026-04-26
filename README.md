@@ -1,410 +1,216 @@
-# palace-daemon
+# palace-daemon (jphein fork)
 
-An HTTP/MCP gateway for [MemPalace](https://github.com/MemPalace/mempalace) that coordinates concurrent access to the palace through a single process.
+**JP's production fork of [rboarescu/palace-daemon](https://github.com/rboarescu/palace-daemon)**
 
-## Why
+[![version-shield](https://img.shields.io/badge/version-1.6.0-4dc9f6?style=flat-square&labelColor=0a0e14)](https://github.com/jphein/palace-daemon/releases) [![upstream-shield](https://img.shields.io/badge/upstream-1.5.1-7dd8f8?style=flat-square&labelColor=0a0e14)](https://github.com/rboarescu/palace-daemon/releases)
+[![python-shield](https://img.shields.io/badge/python-3.12+-7dd8f8?style=flat-square&labelColor=0a0e14&logo=python&logoColor=7dd8f8)](https://www.python.org/)
+[![license-shield](https://img.shields.io/badge/license-MIT-b0e8ff?style=flat-square&labelColor=0a0e14)](LICENSE)
 
-When multiple clients hit MemPalace simultaneously — an AI agent, an Android app, a bulk import job — you want a single chokepoint that controls throughput and keeps mining jobs from starving live queries. palace-daemon provides this through three asyncio semaphores: a read semaphore (N concurrent), a write semaphore (N/2 concurrent), and a mine semaphore (1 at a time). MemPalace ≥3.3.2 handles correctness internally (WAL mode, KG instance lock, mine PID guard); the daemon handles coordination.
+---
 
-## Stability & Concurrency
+Fork of [rboarescu/palace-daemon](https://github.com/rboarescu/palace-daemon), tracking `upstream/main` through the 2026-04-25 sync (upstream just shipped [v1.5.1](https://github.com/rboarescu/palace-daemon/commit/d0aabb9) with `_get_collection` hardening and watchdog improvements; this fork is at v1.6.0 with the additional `/graph` endpoint, structural-snapshot fast path, and deployment tooling). Running in production since 2026-04-24, currently fronting the [jphein/mempalace](https://github.com/jphein/mempalace) **151,420-drawer** canonical palace on [`disks.jphe.in:8085`](https://palace.jphe.in/health). The bulk of the v1.5.0 daemon work (cold-start warmup, `/repair`, `/silent-save`, themed messages, `--palace` flag, MCP timeout) was contributed back to upstream and merged via [PR #4](https://github.com/rboarescu/palace-daemon/pull/4) on 2026-04-25.
 
-> [!CAUTION]
-> **CRITICAL: NEVER mount the palace database via NFS/Samba for direct access.**
-> SQLite and ChromaDB are not network-safe. Direct access over a network mount will cause `SQLITE_IOERR`, HNSW index corruption, and permanent data loss. Always use `palace-daemon` over HTTP for remote access.
+What this fork adds that you won't get from upstream yet: a **`GET /graph` endpoint** (single-shot structural snapshot for SME-style consumers, ~0.4s on the 151K-drawer palace via direct read-only sqlite reads of `embedding_metadata` and `knowledge_graph.sqlite3` — vs. ~60-120s for the equivalent serial MCP composition under load), **`kind=` query-param filter** on `/search` and `/context` that excludes Stop-hook auto-save checkpoints by default (mirrors the fork mempalace's checkpoint-filter — keeps high-density session summaries from dominating retrieval), the **`limit=` parameter actually being honored** (earlier versions silently capped at 5 due to a max_results→limit name mismatch the MCP tool's whitelist dropped), a **`scripts/deploy.sh`** that bundles `git push → wait for sync → systemctl restart → /health poll → verify-routes smoke test` into one command, **`scripts/verify-routes.sh`** as a curl-based smoke test for every public route, **`clients/palace-mode`** CLI for one-command local↔remote palace switching, **`clients/palace-mcp-dispatch.sh`** that picks daemon vs. in-process MCP based on `PALACE_DAEMON_URL`, and **`clients/mempal-fast.py`** — a stdlib-only Stop/PreCompact hook handler that POSTs to `/silent-save` without importing mempalace (so cold hook fires can't trigger ChromaDB's HNSW SIGSEGV class). Full list below.
 
-### The "Daemon-Only" Policy
-To prevent database corruption, this project enforces a strict **Single-Process Access** model:
-1.  **Daemon Lock:** `main.py` uses a file lock (`/tmp/palace-daemon.lock`) to prevent multiple daemon instances from fighting over the database.
-2.  **No Client Fallback:** The `mempalace-mcp.py` client is hard-coded to **fail** if it cannot reach the daemon. It will no longer attempt to open the database files directly. This ensures that your MCP client never accidentally creates a "split-brain" scenario where two processes are writing to the same SQLite file.
+[v1.6.0 release notes](CHANGELOG.md) · [PR #4 — upstream contribution](https://github.com/rboarescu/palace-daemon/pull/4) · [Discussion #5 — Postgres backend](https://github.com/rboarescu/palace-daemon/discussions/5) · [Discussion #6 — TS rewrite heads-up](https://github.com/rboarescu/palace-daemon/discussions/6)
 
-## Features
+## Fork change queue
 
-- **MCP proxy** — any MCP client connects to /mcp instead of spawning a local process
-- **REST API** — search, store, and query the palace over HTTP (Android app, netdash, scripts)
-- **Concurrent access control** — three semaphores coordinate reads, writes, and mine jobs; tunable via `PALACE_MAX_CONCURRENCY`
-- **Isolated mining** — /mine runs under its own semaphore so bulk imports never stall live traffic
-- **Optional API key auth** — set `PALACE_API_KEY` to protect all write endpoints
-- **Configurable** — host, port, palace path via CLI args or env vars
+Everything the fork has ahead of upstream, ranked from easiest follow-up PR to hardest. Contributors: rows near the top are smallest and lowest-risk.
 
-## Requirements
+Status legend: a PR number means there's an open upstream PR for the change; **PR pending** means the fork has the change but no PR has been filed yet; **PR candidate** means the fork has the change, no PR yet, and it's scheduled to be proposed upstream after the maintainer has had time to use the merged v1.5.0 day-to-day. Per [PR #4 issue comment](https://github.com/rboarescu/palace-daemon/pull/4#issuecomment-4321234194), the offer to send post-1.5.0 work as small separate PRs is open at whatever cadence the maintainer wants.
 
+| Area | Change | Status | Size | Risk | Files |
+|---|---|---|---|---|---|
+| **Tooling** | `scripts/deploy.sh` — one-command `git push → wait for sync → systemctl restart → /health poll → verify-routes` deploy. Reads `PALACE_API_KEY` from `~/.claude/settings.local.json` env block, fails fast on sync lag. | PR pending — fork commit [`92cbd35`](https://github.com/jphein/palace-daemon/commit/92cbd35) | small | none | `scripts/deploy.sh` |
+| **Tooling** | `scripts/verify-routes.sh` — curl-based smoke test that exercises every public route post-restart. Designed for manual deploy validation, not CI (depends on a live palace). | PR pending — fork commits [`b4b39fc`](https://github.com/jphein/palace-daemon/commit/b4b39fc), [`f832f66`](https://github.com/jphein/palace-daemon/commit/f832f66) | small | none | `scripts/verify-routes.sh` |
+| **API** | `kind=` query-param on `/search` and `/context` — three values: `content` (default, excludes Stop-hook checkpoints), `checkpoint` (recovery/audit), `all` (no filter). Companion to the mempalace-fork checkpoint filter; backed by `mempalace.searcher`'s read-side `kind=` parameter. Invalid values return 400. | PR pending — fork commit [`b4b39fc`](https://github.com/jphein/palace-daemon/commit/b4b39fc); requires fork mempalace until upstream lands the searcher-side filter | small | low | `main.py` |
+| **API** | `limit=` actually honored on `/search`/`/context`. Earlier code passed `max_results` to the `mempalace_search` MCP tool, but the tool's input_schema declares `limit` — `handle_request` silently dropped the unknown key, capping every response at the default 5 regardless of what the caller asked for. | PR pending — fork commit [`b4b39fc`](https://github.com/jphein/palace-daemon/commit/b4b39fc) | tiny | none | `main.py` |
+| **API** | `_canonical_topic()` rewrites legacy synonyms (currently `"auto-save"` → `"checkpoint"`) at the daemon boundary with a warning log line. Defense-in-depth so client-side topic drift can't silently leak into palace metadata. | PR pending — fork commit [`dd8894c`](https://github.com/jphein/palace-daemon/commit/dd8894c) | tiny | none | `main.py` |
+| **API** | `GET /graph` — single-shot structural snapshot for SME-style consumers. Mirrors `/stats`'s asyncio.gather shape but reads wings + rooms directly from `chroma.sqlite3.embedding_metadata` and KG entities + triples from `knowledge_graph.sqlite3`, leaving only `graph_stats` and `kg_stats` going through MCP. ~200× faster than the serial MCP composition (~0.4s vs. 60-120s under contention), semaphore-free for the heavy parts. | PR pending — fork commits [`2003e80`](https://github.com/jphein/palace-daemon/commit/2003e80), [`127bf68`](https://github.com/jphein/palace-daemon/commit/127bf68), [`7ee7d0c`](https://github.com/jphein/palace-daemon/commit/7ee7d0c); spec at [`docs/graph-endpoint.md`](docs/graph-endpoint.md); coordinated with the [`multipass-structural-memory-eval`](https://github.com/M0nkeyFl0wer/multipass-structural-memory-eval) palace-daemon adapter | medium | low | `main.py`, `scripts/verify-routes.sh`, `docs/graph-endpoint.md`, `CHANGELOG.md` |
+| **API** | `/graph.tunnels` derives from `mempalace_graph_stats.top_tunnels` instead of the broken `mempalace_list_tunnels` (mempalace 3.3.4 — `list_tunnels` returns `[]` while `graph_stats.tunnel_rooms` reports 9 on the canonical palace). Until that's reconciled upstream, the fork prefers `graph_stats` so `/graph.tunnels` and `/stats.graph.tunnel_rooms` always agree. | PR pending — fork commit [`127bf68`](https://github.com/jphein/palace-daemon/commit/127bf68); upstream fix tracked in [`docs/graph-endpoint.md`](docs/graph-endpoint.md) Part 2 | small | low | `main.py` |
+| **Clients** | `clients/palace-mode` — shell CLI that flips between local (in-process) and remote (daemon) palace modes by toggling `PALACE_DAEMON_URL` in `~/.claude/settings.local.json`. Subcommands: `status`, `local`, `remote [URL]`, `install` (idempotent re-apply of plugin-cache customizations after a plugin update), `verify`. | PR pending — fork commits [`f8e0faa`](https://github.com/jphein/palace-daemon/commit/f8e0faa), [`f1910d3`](https://github.com/jphein/palace-daemon/commit/f1910d3), [`d450cef`](https://github.com/jphein/palace-daemon/commit/d450cef) (post-review key/path cleanup) | medium | low | `clients/palace-mode` |
+| **Clients** | `clients/palace-mcp-dispatch.sh` — thin wrapper invoked by the plugin's MCP server command. Dispatches to `mempalace-mcp.py --daemon $URL` when `PALACE_DAEMON_URL` is set; falls back to in-process `python -m mempalace.mcp_server` otherwise. Resolves siblings via `readlink -f`/`dirname`, no hardcoded absolute paths. | PR pending — fork commit [`f8e0faa`](https://github.com/jphein/palace-daemon/commit/f8e0faa), portable-path fix in [`d450cef`](https://github.com/jphein/palace-daemon/commit/d450cef) | tiny | none | `clients/palace-mcp-dispatch.sh` |
+| **Clients** | `clients/mempal-fast.py` — stdlib-only Stop/PreCompact hook handler. Counts human messages in the transcript, gates on `SAVE_INTERVAL`, POSTs to `$PALACE_DAEMON_URL/silent-save`. No `mempalace` import, no chromadb load — so cold hook fires can't trigger the chromadb HNSW SIGSEGV class that the warmup patch addresses for the daemon itself. | PR pending — fork commit [`f8e0faa`](https://github.com/jphein/palace-daemon/commit/f8e0faa) | medium | low | `clients/mempal-fast.py` |
+| **Docs** | `docs/event-log-frame.md` — articulates the architectural frame that mempalace is event-streaming-shaped (Kleppmann's "Turning the database inside-out") and palace-daemon is the materialized-view coordinator over the log. Maps mempalace components to log-vs-view roles, identifies which daemon implementation details are chroma-specific vs. role-level. Reference doc, no code changes. | PR pending — fork commit [`432b3a6`](https://github.com/jphein/palace-daemon/commit/432b3a6); intended to be linkable from upstream Discussion #5 once the maintainer has had more time with the merged daemon | medium | none | `docs/event-log-frame.md` |
+| **Docs** | `docs/graph-endpoint.md` — plan/reference for the `GET /graph` endpoint and the `mempalace_list_tunnels` inconsistency. Marked SHIPPED at the top with the 1.6.0 commit hashes and live perf numbers. | PR pending — fork commit [`450cca3`](https://github.com/jphein/palace-daemon/commit/450cca3) | medium | none | `docs/graph-endpoint.md` |
+
+## What this looks like in practice
+
+The fork's `/graph` endpoint replaces what an SME-style adapter would otherwise compose by serially calling `list_wings` + `list_rooms × N` + `list_tunnels` + `kg_stats` over MCP:
+
+```bash
+$ time curl -sS -H "X-Api-Key: $KEY" https://palace.jphe.in/graph | jq '{
+    wings: (.wings | length),
+    pairs: ([.rooms[] | .rooms | length] | add),
+    tunnels: (.tunnels | length),
+    kg: {entities: (.kg_entities | length), triples: (.kg_triples | length)}
+  }'
+{
+  "wings": 36,
+  "pairs": 165,
+  "tunnels": 9,
+  "kg": { "entities": 6, "triples": 3 }
+}
+
+real    0m0.876s
+```
+
+Deploy is a single command that catches sync-lag footguns (Syncthing-mirrored deployment between dev and prod hosts):
+
+```bash
+$ scripts/deploy.sh
+▸ 1/5  push to origin           ✓ pushed 7ee7d0c → origin/main
+▸ 2/5  wait for sync to disks   ✓ remote at 7ee7d0c
+▸ 3/5  restart palace-daemon    ✓ restart issued
+▸ 4/5  wait for daemon health   ✓ healthy on v1.6.0 (after 3s)
+▸ 5/5  smoke-test routes        ✓ all 11 routes verified
+
+✦ deploy complete: 7ee7d0c on http://disks.jphe.in:8085
+```
+
+Local↔remote palace switching is one command:
+
+```bash
+$ palace-mode status
+Mode: remote (http://disks.jphe.in:8085)
+
+$ palace-mode local
+→ local mode
+
+$ palace-mode remote http://staging:8085
+→ remote mode (PALACE_DAEMON_URL=http://staging:8085)
+```
+
+A Stop hook fires from any Claude Code session and routes through the daemon without ever loading mempalace locally:
+
+```
+[06:29:17] Daemon silent-save: queued=False count=14 (fast-path)
+[06:29:17] Skipping auto-ingest: PALACE_DAEMON_URL set, daemon owns writes
+```
+
+## Why this fork exists
+
+The upstream daemon focused on **stability** — semaphore-coordinated reads/writes, mine isolation, MCP-safe API key auth. JP's fork extended that into **production deployment patterns**:
+
+1. **Single-source-of-truth daemon for distributed Claude Code sessions.** Multiple Claude Code instances (different projects, different terminals, different machines) all routing through one daemon prevents the kind of concurrent-writer SQLite corruption that took down the canonical palace on 2026-04-24. The fork's daemon-strict mode (in [jphein/mempalace](https://github.com/jphein/mempalace)) plus this daemon's queue-and-drain plus `mempal-fast.py`'s no-import path together make that single-writer guarantee enforceable.
+
+2. **Structural snapshots for evaluation frameworks.** When SME ([multipass-structural-memory-eval](https://github.com/M0nkeyFl0wer/multipass-structural-memory-eval)) needed a structural view of the palace for diagnostics, composing it serially over MCP timed out at 60-120s. The fork added `GET /graph` so an evaluator can pull wings, rooms, tunnels, KG entities, and KG triples in one HTTP roundtrip — sub-second on a 151K-drawer palace.
+
+3. **Operational ergonomics.** `palace-mode` for switching local/remote, `deploy.sh` for the one-command release, `verify-routes.sh` for post-restart smoke testing — these are quality-of-life pieces for a daemon that's actually used day-to-day rather than just installed.
+
+The architectural argument for why those pieces survive backend swaps (chroma → pgvector, etc.) is in [`docs/event-log-frame.md`](docs/event-log-frame.md).
+
+## Architectural principles
+
+1. **Single-writer enforced by design.** SQLite + Syncthing replication + multiple writers = corruption. The daemon is the only process that writes to the palace; clients route through it via HTTP/MCP. The fork's `mempal-fast.py` and `palace-mcp-dispatch.sh` make that property hold even for hooks and MCP servers.
+
+2. **Direct sqlite reads for structural data.** `embedding_metadata` and `knowledge_graph.sqlite3` are read-only via `?mode=ro` URI for `/graph`. Bypasses the MCP read semaphore entirely, ~200× faster than the equivalent fan-out under load. Same pattern, different table, for the KG.
+
+3. **Themed messages for save/repair lifecycle.** `messages.py` returns user-facing strings in `systemMessage` so a Claude Code Stop hook surfaces `✦ N memories woven into the palace` without the client knowing the internal save/queue state.
+
+4. **Coordinated rebuild with queue-and-drain.** `/repair mode=rebuild` holds every read/write/mine semaphore slot during the destructive collection swap; `/silent-save` queues to `<palace>/palace-daemon-pending.jsonl` and replays automatically post-rebuild. No saves lost during a rebuild window.
+
+5. **Deploy and verify are the same command.** `deploy.sh` exits non-zero on sync lag, restart failure, or any verify-routes regression. The default cadence for shipping a daemon change is push + restart + verify; if any step fails the deploy aborts, leaving the previous version running.
+
+## Setup
+
+### Requirements
 - Python 3.12+
-- mempalace installed (pipx recommended)
+- mempalace (the [fork](https://github.com/jphein/mempalace) recommended for the `kind=` searcher filter and daemon-strict hook mode)
 
-    pip install -r requirements.txt
+### Install
 
-## Usage
+```bash
+git clone https://github.com/jphein/palace-daemon.git
+cd palace-daemon
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
 
-    # Basic start
-    python main.py
+### Run (manual)
 
-    # Custom palace path and port
-    python main.py --palace ~/.mempalace/palace --port 8085
+```bash
+# Default: port 8085, palace at $PALACE_PATH or ~/.mempalace/palace
+python main.py
 
-    # With API key auth
-    PALACE_API_KEY=your-secret python main.py
+# Custom palace path + auth
+PALACE_API_KEY=$(openssl rand -hex 32) python main.py --palace /mnt/raid/projects/mempalace-data/palace
+```
 
-    # Higher concurrency (default: 4 reads, 2 writes)
-    PALACE_MAX_CONCURRENCY=8 python main.py
+### Run (systemd user service)
 
+```bash
+mkdir -p ~/.config/systemd/user/
+cp palace-daemon.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now palace-daemon
+```
 
-## Security
-
-> **Do not expose port 8085 to the internet without setting `PALACE_API_KEY`.**
-> The `/mine` endpoint accepts arbitrary filesystem paths — anyone with access
-> can trigger reads from any directory on your server.
-
-For local network use, leaving auth disabled is fine. For remote access, always set an API key:
-
-    PALACE_API_KEY=your-secret python main.py
-
-## systemd
-
-### System service (Recommended for servers)
-
-Starts at boot, before any user session. Use this on Artemis or any always-on host.
-
-    sudo cp palace-daemon.service /etc/systemd/system/
-    sudo systemctl daemon-reload
-    sudo systemctl enable --now palace-daemon
-
-### User service (desktops / dev machines only)
-
-Only runs while you're logged in. Use this if you don't have sudo or only need the daemon during your session.
-
-    mkdir -p ~/.config/systemd/user/
-    cp palace-daemon.service ~/.config/systemd/user/
-    systemctl --user daemon-reload
-    systemctl --user enable --now palace-daemon
+Edit the service file to set `PALACE_API_KEY`, `MEMPALACE_PALACE`, and any custom args before installing.
 
 > [!WARNING]
-> **Never install both.** Running a system service and a user service simultaneously causes a port 8085 collision — the second instance will crash-loop with "Another instance already running". Pick one and remove the other.
->
-> To remove a previously installed user service:
->
->     systemctl --user stop palace-daemon
->     systemctl --user disable palace-daemon
->     rm ~/.config/systemd/user/palace-daemon.service
->     systemctl --user daemon-reload
+> **Never install both system AND user services.** They'll fight for port 8085 and the second instance will crash-loop. Pick one.
 
-Edit `palace-daemon.service` to set `PALACE_API_KEY` or a custom `--palace` path before installing.
+> [!CAUTION]
+> **Don't expose port 8085 without setting `PALACE_API_KEY`.** The `/mine` endpoint accepts arbitrary filesystem paths.
 
-## Troubleshooting
+### Plugin client setup
 
-### Port 8085 already in use
-If the daemon fails to start with `[Errno 98] address already in use`, it usually means a previous instance didn't shut down cleanly.
+Use `palace-mode install` to wire the [mempalace plugin](https://github.com/MemPalace/mempalace) cache to talk to this daemon (after pointing `PALACE_DAEMON_URL` at it):
 
-`palace-daemon.service` includes two `ExecStartPre` guards that run automatically on every start:
+```bash
+export PALACE_DAEMON_URL=http://your-host:8085
+export PALACE_API_KEY=...
+~/Projects/palace-daemon/clients/palace-mode install
+~/Projects/palace-daemon/clients/palace-mode verify
+```
 
-    ExecStartPre=-/usr/bin/fuser -k 8085/tcp
-    ExecStartPre=-/usr/bin/rm -f /tmp/palace-daemon-8085.lock
-
-The `-` prefix means failures are ignored (i.e. if nothing is blocking, these are no-ops). If running manually without systemd:
-
-    fuser -k 8085/tcp && rm -f /tmp/palace-daemon-8085.lock
+This installs `mempal-fast.py` as the Stop/PreCompact hook handler and `palace-mcp-dispatch.sh` as the MCP server command in the plugin cache. Idempotent — safe to re-run after plugin updates.
 
 ## API
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | /health | Daemon + palace status (inc. version) |
-| POST | /backup | Atomic verified SQLite backup |
-| POST | /reload | Clear client cache / refresh index |
-| POST | /repair | Coordinate repair with daemon traffic (`mode`: `light`/`scan`/`prune`/`rebuild`) |
-| GET | /repair/status | Current repair state + pending-writes queue depth |
-| POST | /silent-save | Stop-hook silent save; queues during `/repair mode=rebuild` |
-| GET | /stats | Wing/room counts, KG stats. **Heavy call** — fan-outs to three MCP tools and walks the full corpus; expect 30-90s on a 100K+ drawer palace. Designed for admin / debugging, not chat-turn paths. |
-| GET | /search?q=...&limit=5&kind=content | Semantic search. `kind` ∈ {content, checkpoint, all} — see below. |
-| GET | /context?topic=...&kind=content | Same as search, named for LLM use |
-| POST | /memory | Store a drawer {content, wing, room} |
-| POST | /mcp | Full MCP JSON-RPC proxy |
-| POST | /mine | Bulk import under lock |
-
-### /search — `kind=` filter (v1.5.1+)
-
-The `kind` query param controls what shape of drawer the daemon returns. It mirrors the `kind` parameter on jphein/mempalace's `mempalace_search` MCP tool (fork commit `8d02835`).
-
-| Value | Returns | When to use |
+| Route | Method | Purpose |
 |---|---|---|
-| `content` (default) | Substantive drawers; excludes Stop-hook auto-save checkpoints | Almost always — the right answer for retrieval-then-grounding |
-| `checkpoint` | Only Stop-hook checkpoints | Session recovery, hook debugging, audit |
-| `all` | No filter | When you genuinely need every drawer (rare; pre-2026-04-25 behavior) |
+| `/health` | GET | Liveness + version |
+| `/search` | GET | Semantic search; `kind=content\|checkpoint\|all`, `limit=N` |
+| `/context` | GET | Same as `/search`, formatted for LLM prompts |
+| `/stats` | GET | Aggregate KG + graph + status counts |
+| `/graph` | GET | Single-shot structural snapshot (wings, rooms, tunnels, KG) — see [`docs/graph-endpoint.md`](docs/graph-endpoint.md) |
+| `/repair` | POST | Coordinate repair (`mode=light\|scan\|prune\|rebuild`) |
+| `/repair/status` | GET | Current repair state + pending-writes queue depth |
+| `/silent-save` | POST | Stop-hook save path with queue-and-drain during rebuild |
+| `/mine` | POST | Bulk import a directory (validated absolute path only) |
+| `/flush` | POST | Force checkpoint of pending writes |
+| `/reload` | POST | Invalidate cached client + collection |
+| `/backup` | POST | SQLite snapshot to a sibling file |
+| `/mcp` | POST | MCP-protocol passthrough |
 
-Why default to excluding checkpoints? Stop-hook diary entries (`topic=checkpoint`, text starting `"CHECKPOINT:"`) are short word-dense session summaries that consistently outrank substantive content under cosine similarity — by drawer count they're a small fraction of the corpus, but they routinely make up 80%+ of search results. Validated 2026-04-25 on a 151K-drawer palace: same query returned 5 CHECKPOINTs with `kind=all` vs. 5 substantive content drawers with `kind=content`.
+All endpoints honor `X-Api-Key` when `PALACE_API_KEY` is set.
 
-Invalid values return `400 Bad Request`. The daemon also canonicalizes the `topic` field at `/silent-save`: legacy synonyms like `"auto-save"` are rewritten to `"checkpoint"` so the read-side filter works regardless of which client wrote the entry.
-
-### /mine — bulk import
-
-    curl -X POST http://localhost:8085/mine \
-      -H 'Content-Type: application/json' \
-      -d '{"dir": "/path/to/files", "wing": "gemini", "mode": "convos"}'
-
-Body: dir (required), wing, mode (projects/convos), extract (exchange/general), limit.
-
-Mine jobs run one at a time under their own semaphore. Read and write traffic continues unblocked during a mine job.
-
-### /repair — coordinate a repair
-
-    curl -X POST http://localhost:8085/repair \
-      -H 'Content-Type: application/json' \
-      -d '{"mode": "rebuild"}'
-
-Modes:
-
-- **`light`** — clear cached client/collection; next open re-runs `quarantine_stale_hnsw()`. Fast, non-blocking for other endpoints.
-- **`scan`** — read-only inspection. Runs `mempalace.repair.scan_palace`, writes `corrupt_ids.txt` next to the palace, returns the count.
-- **`prune`** — deletes corrupt IDs via `col.delete()`. The in-library flock (`_palace_write_lock`) already serializes this against concurrent writers.
-- **`rebuild`** — destructive: `delete_collection` + `create_collection`. Those backend-level ops are **outside** the `ChromaCollection` flock, so a rebuild racing a concurrent writer silently drops writes. `/repair mode=rebuild` holds every read/write/mine semaphore slot for the rebuild window, and `/silent-save` callers queue to `<palace_parent>/palace-daemon-pending.jsonl` during this window. The queue drains automatically when the rebuild completes.
-
-Only one repair at a time. A second `/repair` call while one is in-flight returns 409.
-
-Check progress with:
-
-    curl http://localhost:8085/repair/status
-
-### /silent-save — Stop-hook save path
-
-    curl -X POST http://localhost:8085/silent-save \
-      -H 'Content-Type: application/json' \
-      -d '{
-        "session_id": "abc-123",
-        "wing": "wing_myproject",
-        "entry": "CHECKPOINT:2026-04-24|session:abc|msgs:15|recent:...",
-        "themes": ["design", "retrieval"],
-        "message_count": 15
-      }'
-
-Normal response (palace is healthy):
-
-    { "count": 15, "themes": [...], "queued": false,
-      "entry_id": "drawer_xyz",
-      "systemMessage": "✦ 15 memories woven into the palace — design, retrieval" }
-
-During `/repair mode=rebuild`:
-
-    { "count": 15, "themes": [...], "queued": true,
-      "systemMessage": "✦ 15 memories held in trust — the palace is being mended" }
-
-The `systemMessage` field is what Claude Code will render in the terminal when the hook returns it as its `systemMessage` output.
-
-#### Wiring Claude Code hooks through the daemon
-
-To have Stop-hook silent saves go through the daemon (queue-safe during repair, themed messages), set `PALACE_DAEMON_URL` (and `PALACE_API_KEY` if auth is on) in the environment the hook runs under. The fork's `mempalace/hooks_cli.py` detects these, POSTs to `/silent-save`, and emits the daemon's `systemMessage`. If the env var isn't set, or the daemon is unreachable, the hook falls through to the legacy direct-write path — no save is ever lost because the daemon happens to be down.
-
-Example env for the hook invocation (in Claude Code hooks config, or upstream of it):
-
-    PALACE_DAEMON_URL=http://localhost:8085
-    PALACE_API_KEY=your-secret     # optional, only if auth is on
-
-### Auth
-
-Pass X-Api-Key: your-secret header on all requests except /health.
-
-
-## Clients
-
-### Supported tools
-
-| Tool | Config file(s) | Has hooks? |
-|---|---|---|
-| claude-code | `~/.claude.json` (mcpServers) + `~/.claude/settings.json` (hooks) | Yes (Stop, PreCompact) |
-| gemini | `~/.gemini/settings.json` | Yes (SessionStart, SessionEnd, PreCompact) |
-| vscode | `~/.vscode/mcp.json` | No |
-| cursor | `~/.cursor/mcp.json` | No |
-| jetbrains | `~/.config/JetBrains/<IDE>/mcp.json` (Linux) or `~/Library/Application Support/JetBrains/<IDE>/mcp.json` (macOS) | No |
-
-### bootstrap.sh — one-command client setup
-
-`clients/bootstrap.sh` sets up a client machine from scratch: copies `mempalace-mcp.py`
-and `hook.py` from Artemis, writes `hook_settings.json`, and patches each tool's config.
-
-**Clients do not need mempalace installed.** Both `hook.py` and `mempalace-mcp.py` are
-stdlib-only — only Artemis (the host) needs `pipx install mempalace`.
+## Development
 
 ```bash
-# Copy from Artemis and run
-scp user@10.0.0.5:/home/user/palace-daemon/clients/bootstrap.sh ~/bootstrap.sh
+# Smoke-test the running daemon
+PALACE_DAEMON_URL=http://localhost:8085 PALACE_API_KEY=... scripts/verify-routes.sh
 
-# Wire a single tool
-bash bootstrap.sh --daemon http://10.0.0.5:8085 --tool claude-code
+# One-command deploy (push + sync-wait + restart + verify)
+scripts/deploy.sh
 
-# Wire everything
-bash bootstrap.sh --daemon http://10.0.0.5:8085 --tool all
+# Switch local Claude Code sessions between modes
+palace-mode {status,local,remote [URL],install,verify}
 ```
 
-`--tool` values: `claude-code` | `gemini` | `vscode` | `cursor` | `jetbrains` | `all`
+## Sources
 
-Files are installed to `~/.local/share/mempalace/`. After running, verify:
+- [rboarescu/palace-daemon](https://github.com/rboarescu/palace-daemon) — upstream
+- [MemPalace/mempalace](https://github.com/MemPalace/mempalace) — the underlying memory system this daemon fronts
+- [jphein/mempalace](https://github.com/jphein/mempalace) — the production fork of mempalace this daemon is paired with
+- [multipass-structural-memory-eval](https://github.com/M0nkeyFl0wer/multipass-structural-memory-eval) — the SME framework whose palace-daemon adapter consumes `/graph`
+- [Apache AGE](https://age.apache.org/) — graph extension for postgres, candidate KG view technology if mempalace's KG ever justifies it (currently doesn't)
+- [pgvector](https://github.com/pgvector/pgvector) — vector extension for postgres, candidate semantic-search view technology under upstream MemPalace [#665](https://github.com/MemPalace/mempalace/pull/665)
 
-```bash
-curl http://10.0.0.5:8085/health
-```
+## License
 
-### hook.py — stdlib hook runner
-
-`clients/hook.py` is a drop-in replacement for `mempalace hook run`. It routes all
-operations through palace-daemon instead of accessing the database directly, eliminating
-the split-brain risk that existed when `mempalace mine` was spawned as a subprocess.
-
-**Zero dependencies** — pure Python stdlib, no mempalace install needed on clients.
-
-```bash
-python3 hook.py --hook stop          --harness claude-code
-python3 hook.py --hook precompact    --harness claude-code
-python3 hook.py --hook session-start --harness codex
-```
-
-#### Behaviour by hook
-
-| Hook | What it does |
-|---|---|
-| `session-start` | Initialises state dir; passes through |
-| `stop` | Counts exchanges; at every 15th — triggers mine approval block or silent diary save depending on `silent_save` |
-| `precompact` | If `MEMPAL_DIR` set, fires `POST /mine` immediately (no approval — compaction is imminent); passes through |
-
-#### Mine routing
-
-| Old behaviour (`mempalace hook run`) | New behaviour (`hook.py`) |
-|---|---|
-| Spawns `mempalace mine` as a subprocess | Returns `decision: block` with approval prompt |
-| Falls back to transcript dir if `MEMPAL_DIR` unset | No mine triggered if `MEMPAL_DIR` unset |
-| Daemon down → still spawns subprocess | Daemon down → passes through silently |
-
-Stop hook mine approval block format:
-
-```
-AUTO-INGEST requested (MemPalace).
-Target directory: /path/to/dir
-
-Show the user this directory and ask them to approve or deny mining it into the palace.
-  Approve → POST {"dir": "/path/to/dir", "mode": "auto"} to http://localhost:8085/mine
-  Deny    → inform user, continue.
-```
-
-#### Hook settings — `~/.mempalace/hook_settings.json`
-
-| Field | Default | Description |
-|---|---|---|
-| `daemon_url` | `http://localhost:8085` | URL of palace-daemon; use the LAN IP on remote clients |
-| `silent_save` | `true` | If true, auto-saves diary entry via daemon and passes through; if false, blocks and asks the AI to save manually |
-| `desktop_toast` | `false` | Fire `notify-send` on save triggers (useful on desktops, skip on SSH) |
-
-Example (Artemis host):
-
-```json
-{
-  "silent_save": true,
-  "desktop_toast": false,
-  "daemon_url": "http://localhost:8085"
-}
-```
-
-Example (remote client pointing at Artemis):
-
-```json
-{
-  "silent_save": true,
-  "desktop_toast": false,
-  "daemon_url": "http://10.0.0.5:8085"
-}
-```
-
-#### Claude Code hook config (`~/.claude/settings.json`)
-
-```json
-{
-  "hooks": {
-    "Stop": [{"hooks": [{"type": "command",
-      "command": "python3 /path/to/hook.py --hook stop --harness claude-code",
-      "timeout": 30}]}],
-    "PreCompact": [{"hooks": [{"type": "command",
-      "command": "python3 /path/to/hook.py --hook precompact --harness claude-code",
-      "timeout": 60}]}]
-  }
-}
-```
-
-#### Gemini CLI hook config (`~/.gemini/settings.json`)
-
-```json
-{
-  "hooks": {
-    "SessionStart": [{"name": "mempalace-session-start", "type": "command",
-      "command": "python3", "args": ["/path/to/hook.py", "--hook", "session-start", "--harness", "codex"]}],
-    "SessionEnd": [{"name": "mempalace-session-stop", "type": "command",
-      "command": "python3", "args": ["/path/to/hook.py", "--hook", "stop", "--harness", "codex"]}],
-    "PreCompact": [{"name": "mempalace-precompact", "type": "command",
-      "command": "python3", "args": ["/path/to/hook.py", "--hook", "precompact", "--harness", "codex"],
-      "timeout": 30}]
-  }
-}
-```
-
-### mempalace-mcp
-
-`clients/mempalace-mcp.py` bridges any MCP client to palace-daemon over HTTP.
-Use this on machines that don't host the palace locally — they talk to the
-daemon instead of running mempalace themselves.
-
-**Zero dependencies** — stdlib only, works anywhere Python 3.8+ is installed.
-
-Claude Code setup (`~/.claude.json` → `mcpServers`):
-
-```json
-{
-  "mempalace": {
-    "type": "stdio",
-    "command": "python3",
-    "args": ["/path/to/clients/mempalace-mcp.py", "--daemon", "http://YOUR_SERVER:8085"],
-    "env": {}
-  }
-}
-```
-
-With API key: pass `--api-key your-secret` or set `PALACE_API_KEY` env var.
-
-**Safety First:** If the daemon is unreachable, the client will exit with an error rather than falling back to direct database access. This prevents concurrent access conflicts and ensures stability.
-
-## Testing & Development
-
-To test changes (like auto-healing or stress tests) without risking your production data or interfering with the primary daemon on port 8085, use a **Shadow Palace** via Docker.
-
-### Shadow Palace (Docker)
-
-1. **Clone your data:**
-   ```bash
-   mkdir -p ~/.mempalace/test_palace
-   cp -r ~/.mempalace/palace/* ~/.mempalace/test_palace/
-   ```
-
-2. **Run the test container:**
-   ```bash
-   docker compose -f docker-compose.test.yml up --build -d
-   ```
-
-This starts a fully isolated daemon on **port 8086** using your test data. It uses a separate lock file inside the container, ensuring it doesn't collide with your production `palace-daemon-terminal`.
-
-### Validation
-
-Check the health of your test instance:
-```bash
-curl http://localhost:8086/health
-```
-
-
-## Architecture
-
-    Clients (Claude Code / Android app / netdash / curl)
-            |
-            v
-      palace-daemon (FastAPI)
-        ├── _read_sem(N)   — search, query, stats, …
-        ├── _write_sem(N/2) — add, update, kg mutations, …
-        └── _mine_sem(1)   — bulk import jobs
-            |
-            v
-      mempalace.mcp_server
-            |
-            v
-      ChromaDB / palace files
+MIT — same as upstream.
