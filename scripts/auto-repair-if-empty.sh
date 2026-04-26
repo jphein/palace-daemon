@@ -38,16 +38,21 @@ KEY="${PALACE_API_KEY:-}"
 HEADERS=()
 [ -n "$KEY" ] && HEADERS=(-H "x-api-key: $KEY")
 
-# Wait up to 30s for the daemon to start responding to /health
-log "waiting for daemon on ${HOST}:${PORT}..."
-for i in $(seq 1 30); do
+# Wait up to WAIT_SECS for the daemon to start responding to /health.
+# 151K-drawer palaces take ~60-120s to load HNSW segments from disk on
+# first startup; 30s wasn't enough and the script bailed exactly when
+# auto-repair was most useful. 240s gives generous runway without making
+# the unit hang forever if the daemon is genuinely broken.
+WAIT_SECS="${PALACE_AUTO_REPAIR_WAIT_SECS:-240}"
+log "waiting up to ${WAIT_SECS}s for daemon on ${HOST}:${PORT}..."
+for i in $(seq 1 "$WAIT_SECS"); do
   if curl -sS --max-time 2 "${HEADERS[@]}" "http://${HOST}:${PORT}/health" >/dev/null 2>&1; then
     log "daemon up after ${i}s"
     break
   fi
   sleep 1
-  if [ "$i" = "30" ]; then
-    log "daemon never came up — bailing"
+  if [ "$i" = "$WAIT_SECS" ]; then
+    log "daemon never came up after ${WAIT_SECS}s — bailing"
     exit 0  # don't fail the unit; just don't auto-repair
   fi
 done
