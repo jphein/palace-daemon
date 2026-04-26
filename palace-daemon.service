@@ -9,6 +9,10 @@ WorkingDirectory=/home/user/palace-daemon
 ExecStartPre=-/usr/bin/fuser -k 8085/tcp
 ExecStartPre=-/usr/bin/rm -f /home/user/.cache/palace-daemon/daemon-8085.lock
 ExecStart=/home/user/.local/share/pipx/venvs/mempalace/bin/python main.py
+# After the daemon binds, probe /search for the empty-HNSW warning and
+# auto-trigger /repair {mode:rebuild} in the background if detected.
+# Idempotent + non-blocking — see scripts/auto-repair-if-empty.sh.
+ExecStartPost=/home/user/palace-daemon/scripts/auto-repair-if-empty.sh
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal
