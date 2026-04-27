@@ -1,5 +1,22 @@
 # Changelog
 
+## [1.7.2] - 2026-04-27
+
+### Pulled in from upstream/main (rboarescu's v1.5.1, sync 2026-04-27)
+- **`_get_collection` silent failures** — exceptions now logged (palace path + error) instead of silently returning `None`.
+- **Stale collection cache self-healing** — `_get_collection` retries once after clearing all caches on failure; the incident that required a manual daemon restart now self-heals on the next tool call.
+- **HNSW `num_threads=1` enforced on every open** — `_get_collection` calls `collection.modify()` after every open, merging the metadata in. ChromaDB 1.5.x does not persist HNSW metadata across reopens (issue #1161); without this, every cache clear silently re-enabled parallel inserts and risked SIGSEGV under concurrent writes.
+- **`/health` reflects actual palace state** — previously returned HTTP 200 `ok` even when the collection was broken. Now calls `_get_collection()` and returns HTTP 503 `degraded` if the palace is unavailable.
+- **Systemd watchdog** — daemon sends `READY=1` on startup and `WATCHDOG=1` every `WatchdogSec/2` seconds via `sd_notify` (stdlib-only). Watchdog pings are gated on a live `_get_collection()` check; if the palace goes dark, the watchdog goes silent and systemd restarts the daemon. `palace-daemon.service` updated: `Type=notify`, `NotifyAccess=main`, `WatchdogSec=120`.
+- **Startup warmup opens the collection** — lifespan warmup calls `_get_collection(create=True)` directly instead of `ping`, so `num_threads=1` is applied before `_warn_if_hnsw_threads_unset` runs at startup.
+- **`PALACE_MAX_READ_CONCURRENCY` / `PALACE_MAX_WRITE_CONCURRENCY` env vars** — split out from `PALACE_MAX_CONCURRENCY` for finer control. Set `PALACE_MAX_WRITE_CONCURRENCY=1` to serialize writes (mitigates issue #1161).
+- **`--force` flag and self-healing startup** — automatically clears stale processes on the target port. Our fork's existing `ExecStartPre=fuser -k` accomplishes the same thing belt-and-suspenders.
+- **Toast-injection revert** — `a64244c` reverted MCP-breaking toast injection, kept REST endpoint toasts.
+
+### Fork-side notes
+- Naming collision: this fork released its own v1.5.1 (`b4b39fc`, kind= filter + `_canonical_topic` + verify-routes.sh + limit= bug fix) before upstream tagged v1.5.1 with the content above. The two v1.5.1's cover different work; our fork's history kept its v1.5.1 entry below for posterity.
+- Note: PR #4 was *closed* on the upstream side rather than merged via the GitHub UI — rboarescu cherry-picked the contents into upstream `main` directly as `ef6ac03` and closed the PR. Our README phrasing ("merged via PR #4") will be tightened in a follow-up.
+
 ## [1.7.1] - 2026-04-27
 
 ### Removed
@@ -40,7 +57,7 @@
 - **`/search` and `/context` now actually honor `limit=`.** Earlier versions passed `max_results` to the `mempalace_search` MCP tool, but the tool's input_schema declares `limit` — `mempalace.mcp_server.handle_request` then silently dropped the unknown key via its schema-property whitelist (line 1677), and *every* response was capped at the default 5 regardless of what the user asked for. Confirmed against running v1.5.0. Renamed to `limit` so the user-supplied value actually binds.
 
 ### Notes
-- The `/search` filter is a daemon-side wrapper around the read-side filter that lives in `mempalace.searcher`. It works because the daemon imports the fork's mempalace at `/mnt/raid/projects/memorypalace`. Upstream MemPalace doesn't have the `kind=` parameter on `mempalace_search` yet — fork PR pending. Until that lands, this daemon needs the fork checked out as its mempalace install.
+- The `/search` filter is a daemon-side wrapper around the read-side filter that lives in `mempalace.searcher`. It works because the daemon imports the fork's mempalace at `/mnt/raid/projects/memorypalace`. Upstream MemPalace doesn't have the `kind=` parameter on `mempalace_search` yet — fork PR pending. Until that lands, this daemon needs the fork checked out as its mempalace install. **Update 2026-04-27:** retired in fork v1.7.1; structural fix made it inert.
 
 ## [1.5.0] - 2026-04-24
 
@@ -57,6 +74,18 @@
 ### Notes
 - The rebuild coordination is daemon-scoped: external `mempalace repair rebuild` CLI invocations still race against any other process's writes because `delete_collection` / `create_collection` are backend-level operations that the `ChromaCollection` flock does not protect. For safe concurrent rebuilds, route through the daemon.
 - Fork's `mempalace/hooks_cli.py` opt-in: set `PALACE_DAEMON_URL` (and optionally `PALACE_API_KEY`) and silent Stop-hook saves will POST to the daemon, picking up the queue-and-drain behavior and themed messages. Unset or unreachable → falls through to the legacy direct-write path with no behavior change.
+
+## [1.4.5] - 2026-04-25
+
+### Changed
+- **`clients/hook.py` — time-based and session-end saves**
+  - `TIME_SAVE_INTERVAL` (300 s) was defined but never used; now wired in as a second independent save trigger in `hook_stop`. Saves fire if ≥5 min have elapsed with any unsaved exchanges, regardless of the 15-exchange count gate.
+  - New `force_on_stop` setting (default `true`) adds a third trigger: saves whenever `since_last > 0` and at least `force_min_interval` seconds (default 60 s) have passed since the last save. Captures session-end stops that fall below the exchange-count threshold.
+  - `force_min_interval` is now configurable via `hook_settings.json` (falls back to hardcoded `FORCE_MIN_INTERVAL = 60`).
+  - `hook_session_start` seeds `{session_id}_last_save_ts` at session open so the first Stop of a new session doesn't spuriously fire the time trigger.
+  - `hook_session_start` now prunes state files older than 7 days from `~/.mempalace/hook_state/` to prevent unbounded accumulation.
+  - Module docstring updated to list all four `hook_settings.json` keys (`force_on_stop`, `force_min_interval` added).
+  - Diary auto-save entries now embed the trigger reason (`hook.count`, `hook.time`, `hook.force`).
 
 ## [1.4.2] - 2026-04-24
 

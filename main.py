@@ -39,12 +39,14 @@ import messages
 
 # ── Config (env vars override CLI defaults) ───────────────────────────────────
 
-VERSION = "1.7.1"
+VERSION = "1.7.2"
 DEFAULT_HOST = os.getenv("PALACE_HOST", "0.0.0.0")
 DEFAULT_PORT = int(os.getenv("PALACE_PORT", "8085"))
 DEFAULT_PALACE = os.getenv("PALACE_PATH", "")
 API_KEY = os.getenv("PALACE_API_KEY", "")  # read at startup for argparse default; auth checks re-read from env dynamically
 PALACE_MAX_CONCURRENCY = int(os.getenv("PALACE_MAX_CONCURRENCY", "4"))
+PALACE_MAX_READ_CONCURRENCY = int(os.getenv("PALACE_MAX_READ_CONCURRENCY", str(PALACE_MAX_CONCURRENCY)))
+PALACE_MAX_WRITE_CONCURRENCY = int(os.getenv("PALACE_MAX_WRITE_CONCURRENCY", str(max(1, PALACE_MAX_CONCURRENCY // 2))))
 
 # Canonical topic for Stop-hook auto-save checkpoint diary entries.
 # Defined here so /silent-save can canonicalize at the daemon boundary
@@ -57,12 +59,14 @@ CHECKPOINT_TOPIC = "checkpoint"
 # and emits a warning log line. The write-side router accepts both.
 CHECKPOINT_TOPIC_SYNONYMS = ("auto-save",)
 
-# Read ops: up to N concurrent.
-# Regular write ops: up to N//2 concurrent (mempalace ≥3.3.2 is internally safe).
+# Read ops: up to PALACE_MAX_READ_CONCURRENCY concurrent.
+# Write ops: up to PALACE_MAX_WRITE_CONCURRENCY concurrent.
+# Set PALACE_MAX_WRITE_CONCURRENCY=1 to serialise writes (mitigates MemPalace
+# issue #1161 — HNSW num_threads not persisted in ChromaDB 1.5.x).
 # Mine jobs: exclusive semaphore independent of reads/writes so a long mine
 # doesn't starve normal traffic.
-_read_sem = asyncio.Semaphore(PALACE_MAX_CONCURRENCY)
-_write_sem = asyncio.Semaphore(max(1, PALACE_MAX_CONCURRENCY // 2))
+_read_sem = asyncio.Semaphore(PALACE_MAX_READ_CONCURRENCY)
+_write_sem = asyncio.Semaphore(PALACE_MAX_WRITE_CONCURRENCY)
 _mine_sem = asyncio.Semaphore(1)
 
 # Repair state — when in_progress is True, /silent-save queues instead of writing.
@@ -72,6 +76,75 @@ _repair_state: dict[str, Any] = {"in_progress": False, "mode": None, "started_at
 _repair_lock = asyncio.Lock()
 
 _log = logging.getLogger("palace-daemon")
+
+
+# ── Systemd watchdog / sd_notify ─────────────────────────────────────────────
+
+def _sd_notify(msg: str) -> None:
+    """Send a message to systemd notify socket without external dependencies."""
+    sock_path = os.environ.get("NOTIFY_SOCKET", "")
+    if not sock_path:
+        return
+    try:
+        import socket as _sock
+        with _sock.socket(_sock.AF_UNIX, _sock.SOCK_DGRAM) as s:
+            # Abstract namespace sockets use NUL prefix; systemd uses @ prefix.
+            addr = chr(0) + sock_path[1:] if sock_path.startswith("@") else sock_path
+            s.sendto(msg.encode(), addr)
+    except Exception:
+        pass
+
+
+def _watchdog_interval() -> int:
+    """Return WatchdogSec in seconds from WATCHDOG_USEC (set by systemd), or 0."""
+    try:
+        return int(os.environ.get("WATCHDOG_USEC", "0")) // 1_000_000
+    except ValueError:
+        return 0
+
+
+async def _watchdog_loop(interval_secs: int) -> None:
+    """Ping systemd watchdog at half the watchdog interval, only when palace is healthy."""
+    tick = max(10, interval_secs // 2)
+    while True:
+        await asyncio.sleep(tick)
+        try:
+            loop = asyncio.get_running_loop()
+            col = await loop.run_in_executor(None, _mp._get_collection)
+            if col is not None:
+                _sd_notify("WATCHDOG=1\n")
+            else:
+                _log.warning("Watchdog: palace collection unavailable — skipping WATCHDOG=1")
+        except Exception as e:
+            _log.warning("Watchdog check failed: %s", e)
+
+
+async def _warn_if_hnsw_threads_unset() -> None:
+    """Warn if hnsw:num_threads != 1 after a collection reopen.
+
+    ChromaDB 1.5.x does not persist HNSW metadata across reopens (MemPalace
+    issue #1161). After any cache clear the collection silently reverts to
+    parallel inserts, risking SIGSEGV under concurrent writes.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _mp.handle_request, {
+            "jsonrpc": "2.0", "id": "hnsw-check", "method": "ping", "params": {}
+        })
+        col = _mp._collection_cache
+        meta = (col and getattr(col, "_collection", None) and
+                getattr(col._collection, "metadata", None)) or {}
+        threads = meta.get("hnsw:num_threads")
+        if threads != 1:
+            _log.warning(
+                "HNSW num_threads=%s after collection reopen — parallel inserts active. "
+                "Concurrent writes risk SIGSEGV. See MemPalace issue #1161. "
+                "Upgrade to mempalace >=3.3.4 when available.",
+                threads,
+            )
+    except Exception:
+        pass
+
 
 # Tools that only read state — everything else is treated as a write.
 _READ_TOOLS = {
@@ -120,6 +193,7 @@ async def _auto_repair():
         _log.warning("AUTO-REPAIR: Quarantined %d stale HNSW segments. Reloading client.", len(moved))
         _mp._client_cache = None
         _mp._collection_cache = None
+        await _warn_if_hnsw_threads_unset()
         return len(moved)
     _log.info("AUTO-REPAIR: No stale segments found during scan.")
     return 0
@@ -165,7 +239,7 @@ async def _exclusive_palace():
 def _pending_writes_path() -> str:
     """Location of the jsonl queue that holds silent-saves during rebuild."""
     palace_path = _mp._config.palace_path
-    parent = os.path.dirname(palace_path.rstrip("/")) or "/tmp"
+    parent = os.path.dirname(palace_path.rstrip("/")) or os.path.expanduser("~")
     return os.path.join(parent, "palace-daemon-pending.jsonl")
 
 
@@ -350,14 +424,24 @@ async def lifespan(app: FastAPI):
     # Warm the ChromaDB client before accepting traffic. The Rust HNSW binding
     # occasionally segfaults on the very first request if opened cold; opening
     # it here (before yield) ensures the PersistentClient is fully initialized.
+    # We open the collection directly (not via ping) so that _get_collection's
+    # hnsw:num_threads=1 fix is applied before _warn_if_hnsw_threads_unset runs.
     try:
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, _mp.handle_request, {
-            "jsonrpc": "2.0", "id": "warmup", "method": "ping", "params": {}
-        })
+        await loop.run_in_executor(None, _mp._get_collection, True)
         logger.info("Palace client warmed up.")
     except Exception as e:
-        logger.warning("Warmup ping failed (non-fatal): %s", e)
+        logger.warning("Warmup collection open failed (non-fatal): %s", e)
+    await _warn_if_hnsw_threads_unset()
+
+    # Signal systemd that startup is complete (Type=notify in service file).
+    _sd_notify("READY=1\n")
+
+    # Start systemd watchdog loop if WatchdogSec is configured.
+    wdog_secs = _watchdog_interval()
+    if wdog_secs > 0:
+        asyncio.create_task(_watchdog_loop(wdog_secs))
+        logger.info("Systemd watchdog active (interval=%ds, tick=%ds).", wdog_secs, max(10, wdog_secs // 2))
 
     yield
     
@@ -398,7 +482,18 @@ async def health():
     # Bypass semaphores — health must respond even when all slots are busy.
     loop = asyncio.get_running_loop()
     result = await loop.run_in_executor(None, _mp.handle_request, {"jsonrpc": "2.0", "id": 1, "method": "ping", "params": {}}) or {}
-    return {"status": "ok", "daemon": "palace-daemon", "version": VERSION, "palace": result}
+    # Test actual collection access so /health reflects true palace state.
+    palace_ok = False
+    try:
+        col = await loop.run_in_executor(None, _mp._get_collection)
+        palace_ok = col is not None
+    except Exception:
+        pass
+    status = "ok" if palace_ok else "degraded"
+    payload = {"status": status, "daemon": "palace-daemon", "version": VERSION, "palace": result}
+    if not palace_ok:
+        return JSONResponse(content=payload, status_code=503)
+    return payload
 
 
 def _search_args(query: str, limit: int) -> dict:
@@ -527,7 +622,10 @@ async def store_memory(request: Request, x_api_key: str | None = Header(default=
             "arguments": {"wing": wing, "room": room, "content": content},
         },
     })
-    return _unwrap(result)
+    unwrapped = _unwrap(result)
+    if isinstance(unwrapped, dict) and unwrapped.get('success'):
+        unwrapped['toast'] = f'Filed to {wing}/{room}'
+    return unwrapped
 
 
 @app.get("/stats")
@@ -935,25 +1033,9 @@ async def silent_save(request: Request, x_api_key: str | None = Header(default=N
         if msg_count <= 0:
             msg_count = 1
 
+    # Acquire write slot, check rebuild flag under lock, then write or queue.
     # Queue only when /repair is doing a rebuild — other modes (light/scan/
-    # prune) don't replace the collection out from under in-flight writes,
-    # so silent-saves can proceed normally.
-    queue_writes = (
-        _repair_state["in_progress"]
-        and _repair_state.get("mode") == "rebuild"
-    )
-
-    # Fast-path: rebuild in progress, queue immediately.
-    if queue_writes:
-        await _enqueue_pending_write(body)
-        return {
-            "count": msg_count,
-            "themes": themes,
-            "queued": True,
-            "systemMessage": messages.save_queued(msg_count, themes),
-        }
-
-    # Normal path: acquire write slot, re-check flag under lock, then write.
+    # prune) don't replace the collection out from under in-flight writes.
     async with _write_sem:
         if (
             _repair_state["in_progress"]
@@ -974,6 +1056,7 @@ async def silent_save(request: Request, x_api_key: str | None = Header(default=N
             "themes": themes,
             "queued": False,
             "entry_id": result.get("entry_id"),
+            "toast": f"Palace updated: {msg_count} msgs saved ({themes[0] if themes else "checkpoint"})",
             "systemMessage": messages.save_ok(msg_count, themes),
         }
     raise HTTPException(
@@ -1033,6 +1116,7 @@ async def repair(request: Request, x_api_key: str | None = Header(default=None))
                 _mp._client_cache = None
                 _mp._collection_cache = None
                 result = {"caches_cleared": True}
+            await _warn_if_hnsw_threads_unset()
 
         elif mode == "scan":
             # Read-only: cap at read slot.
@@ -1060,6 +1144,7 @@ async def repair(request: Request, x_api_key: str | None = Header(default=None))
                 result = {"pruned": True}
             _mp._client_cache = None
             _mp._collection_cache = None
+            await _warn_if_hnsw_threads_unset()
 
         elif mode == "rebuild":
             # Destructive: deletes + recreates the collection. Hold every
@@ -1071,6 +1156,7 @@ async def repair(request: Request, x_api_key: str | None = Header(default=None))
                 _mp._client_cache = None
                 _mp._collection_cache = None
                 result = {"rebuilt": True}
+            await _warn_if_hnsw_threads_unset()
 
     except Exception as e:
         _log.exception("repair (%s) failed", mode)
@@ -1137,6 +1223,16 @@ def _unwrap(mcp_response: dict) -> Any:
 _lock_file = None
 
 
+def _clear_port(port: int):
+    """Attempt to kill any process currently holding the target port."""
+    import subprocess
+    try:
+        # Use fuser to kill the process on the port.
+        subprocess.run(["fuser", "-k", f"{port}/tcp"], capture_output=True)
+    except Exception:
+        pass
+
+
 def main():
     global _lock_file
     parser = argparse.ArgumentParser(description="palace-daemon — MemPalace HTTP/MCP gateway")
@@ -1144,7 +1240,18 @@ def main():
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="Bind port (default: 8085)")
     parser.add_argument("--palace", default=DEFAULT_PALACE, help="Palace path (overrides mempalace config)")
     parser.add_argument("--api-key", default=API_KEY, help="API key for auth (optional)")
+    parser.add_argument("--force", action="store_true", help="Force clear port before starting (used by systemd)")
+    parser.add_argument("--manual", action="store_true", help="Allow manual start outside of systemd")
     args = parser.parse_args()
+
+    # Prevent accidental manual starts by agents
+    if not os.getenv("INVOCATION_ID") and not args.manual:
+        print("ERROR: Manual startup detected. Use 'sudo systemctl start palace-daemon' instead.")
+        print("If you MUST run manually for debugging, use the --manual flag.")
+        sys.exit(1)
+
+    if args.force:
+        _clear_port(args.port)
 
     # Simple file lock to prevent multiple daemon instances on the same port.
     # ~/.cache/palace-daemon/ (mode 0o700) avoids world-writable /tmp exposure.

@@ -3,7 +3,8 @@ Description=palace-daemon — MemPalace HTTP/MCP gateway
 After=network.target
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
 User=user
 WorkingDirectory=/home/user/palace-daemon
 ExecStartPre=-/usr/bin/fuser -k 8085/tcp
@@ -15,9 +16,12 @@ ExecStart=/home/user/.local/share/pipx/venvs/mempalace/bin/python main.py
 ExecStartPost=/home/user/palace-daemon/scripts/auto-repair-if-empty.sh
 Restart=on-failure
 RestartSec=5
+WatchdogSec=120
 StandardOutput=journal
 StandardError=journal
 Environment=PYTHONUNBUFFERED=1
+Environment=PALACE_MAX_READ_CONCURRENCY=4
+Environment=PALACE_MAX_WRITE_CONCURRENCY=1
 
 [Install]
 WantedBy=multi-user.target
