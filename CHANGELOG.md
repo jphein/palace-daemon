@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.7.1] - 2026-04-27
+
+### Removed
+- **`kind=` query parameter on `/search` and `/context`**. Companion to mempalace fork's [`7ba28dc`](https://github.com/jphein/mempalace/commit/7ba28dc) retiring the read-side `kind=` filter machinery. After the Phase A–E checkpoint collection split (mempalace) all Stop-hook auto-save checkpoints live in the dedicated `mempalace_session_recovery` collection; verified empirically on the canonical 151K-drawer palace (763 checkpoints in recovery, 0 in `mempalace_drawers`). The filter was filtering nothing.
+- `_VALID_KINDS` constant and the kind validation in `_search_args`.
+- `kind=`-related probes from `scripts/verify-routes.sh`.
+- Recovery checkpoint reads remain available via mempalace's `mempalace_session_recovery_read` MCP tool.
+
 ## [1.7.0] - 2026-04-26
 
 ### Added
