@@ -201,7 +201,7 @@ This installs `mempal-fast.py` as the Stop/PreCompact hook handler and `palace-m
 | Route | Method | Purpose |
 |---|---|---|
 | `/health` | GET | Liveness + version |
-| `/search` | GET | Semantic search; `kind=content\|checkpoint\|all`, `limit=N` |
+| `/search` | GET | Semantic search over `mempalace_drawers`; `limit=N`. (Stop-hook checkpoints live in `mempalace_session_recovery` — read via the `mempalace_session_recovery_read` MCP tool.) |
 | `/context` | GET | Same as `/search`, formatted for LLM prompts |
 | `/stats` | GET | Aggregate KG + graph + status counts |
 | `/graph` | GET | Single-shot structural snapshot (wings, rooms, tunnels, KG) — see [`docs/graph-endpoint.md`](docs/graph-endpoint.md) |
