@@ -67,6 +67,10 @@ probe "GET /search?kind=all" "results" "$URL/search?q=palace-daemon&limit=2&kind
 probe "GET /search?kind=checkpoint" "results" "$URL/search?q=palace-daemon&limit=2&kind=checkpoint"
 probe "GET /search rejects bad kind" "must be one of" "$URL/search?q=x&kind=bogus"
 
+# /list — query-free metadata listing, complementary to /search.
+probe "GET /list (no filters)" "drawers" "$URL/list?limit=2"
+probe "GET /list?wing=projects" "drawers" "$URL/list?wing=projects&limit=2"
+
 # /context — same code path with a different param name for LLM-friendly prompts.
 probe "GET /context (default kind=content)" "results" "$URL/context?topic=palace-daemon&limit=2"
 probe "GET /context?kind=all" "results" "$URL/context?topic=palace-daemon&limit=2&kind=all"
