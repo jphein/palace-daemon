@@ -59,13 +59,9 @@ echo
 # /health — no auth, should always respond.
 probe "GET /health" "palace-daemon" "$URL/health"
 
-# /search — verifies the kind= and limit= params are honored. Earlier
-# versions silently dropped limit (passed as max_results) and had no
-# kind= support.
-probe "GET /search (default kind=content)" "results" "$URL/search?q=palace-daemon&limit=2"
-probe "GET /search?kind=all" "results" "$URL/search?q=palace-daemon&limit=2&kind=all"
-probe "GET /search?kind=checkpoint" "results" "$URL/search?q=palace-daemon&limit=2&kind=checkpoint"
-probe "GET /search rejects bad kind" "must be one of" "$URL/search?q=x&kind=bogus"
+# /search — verifies the limit= param is honored. Earlier versions
+# silently dropped limit (passed as max_results).
+probe "GET /search" "results" "$URL/search?q=palace-daemon&limit=2"
 
 # /list — query-free metadata listing, complementary to /search.
 probe "GET /list (no filters)" "drawers" "$URL/list?limit=2"
@@ -75,8 +71,7 @@ probe "GET /list?wing=projects" "drawers" "$URL/list?wing=projects&limit=2"
 # they mutate state. Skipped in smoke; covered in dedicated integration runs.)
 
 # /context — same code path with a different param name for LLM-friendly prompts.
-probe "GET /context (default kind=content)" "results" "$URL/context?topic=palace-daemon&limit=2"
-probe "GET /context?kind=all" "results" "$URL/context?topic=palace-daemon&limit=2&kind=all"
+probe "GET /context" "results" "$URL/context?topic=palace-daemon&limit=2"
 
 # /stats — read-only summary across kg + graph + status tools.
 probe "GET /stats" "kg" "$URL/stats"
@@ -92,7 +87,7 @@ probe "GET /viz" 'palace-daemon' "$URL/viz"
 probe_json_field "GET /repair/status" "in_progress" "$URL/repair/status"
 
 # limit= is honored — proves the max_results→limit fix landed.
-COUNT=$(curl -sS --max-time 90 "${H_AUTH[@]}" "$URL/search?q=palace&limit=3&kind=all" \
+COUNT=$(curl -sS --max-time 90 "${H_AUTH[@]}" "$URL/search?q=palace&limit=3" \
   | python3 -c "import json, sys; print(len(json.load(sys.stdin).get('results', [])))" 2>&1)
 if [ "$COUNT" = "3" ]; then
   pass "limit=3 returns 3 hits (max_results fix)"
@@ -100,19 +95,6 @@ elif [ "$COUNT" = "0" ] || [ -z "$COUNT" ]; then
   echo "  ? limit=3 returned 0 — palace may be empty or unreachable, can't confirm fix"
 else
   fail "limit=3 returned $COUNT hits — expected 3 (or 0 on empty palace)"
-fi
-
-# Default kind=content excludes more drawers than kind=all.
-ALL=$(curl -sS --max-time 90 "${H_AUTH[@]}" "$URL/search?q=palace&limit=20&kind=all" \
-  | python3 -c "import json, sys; d=json.load(sys.stdin); print(d.get('available_in_scope', 0))" 2>&1)
-CONTENT=$(curl -sS --max-time 90 "${H_AUTH[@]}" "$URL/search?q=palace&limit=20&kind=content" \
-  | python3 -c "import json, sys; d=json.load(sys.stdin); print(d.get('available_in_scope', 0))" 2>&1)
-if [ "$ALL" -gt "$CONTENT" ] 2>/dev/null; then
-  pass "kind=content scope ($CONTENT) < kind=all scope ($ALL) — checkpoint filter active"
-elif [ "$ALL" = "0" ] || [ "$ALL" = "$CONTENT" ]; then
-  echo "  ? kind=content scope == kind=all scope ($CONTENT) — palace may have no checkpoints to filter"
-else
-  fail "kind=content scope ($CONTENT) >= kind=all scope ($ALL) — filter is not active"
 fi
 
 echo

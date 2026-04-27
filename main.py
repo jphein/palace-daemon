@@ -49,16 +49,13 @@ PALACE_MAX_CONCURRENCY = int(os.getenv("PALACE_MAX_CONCURRENCY", "4"))
 # Canonical topic for Stop-hook auto-save checkpoint diary entries.
 # Defined here so /silent-save can canonicalize at the daemon boundary
 # even when client code drifts. Must match clients/hook.py and
-# clients/mempal-fast.py and the read-side filter list in
-# mempalace.searcher._CHECKPOINT_TOPICS.
+# clients/mempal-fast.py. mempalace's tool_diary_write routes drawers
+# with this topic to the dedicated mempalace_session_recovery collection.
 CHECKPOINT_TOPIC = "checkpoint"
 # Legacy synonyms that older clients (or future buggy ones) might write.
 # When /silent-save sees one of these, it rewrites to CHECKPOINT_TOPIC
-# and emits a warning log line. The read-side filter accepts both.
+# and emits a warning log line. The write-side router accepts both.
 CHECKPOINT_TOPIC_SYNONYMS = ("auto-save",)
-# Valid kind= values for /search and /context. Mirrors the enum on the
-# mempalace_search MCP tool's input_schema. Anything else => 400.
-_VALID_KINDS = ("content", "checkpoint", "all")
 
 # Read ops: up to N concurrent.
 # Regular write ops: up to N//2 concurrent (mempalace ≥3.3.2 is internally safe).
@@ -404,40 +401,33 @@ async def health():
     return {"status": "ok", "daemon": "palace-daemon", "version": VERSION, "palace": result}
 
 
-def _search_args(query: str, limit: int, kind: str) -> dict:
+def _search_args(query: str, limit: int) -> dict:
     """Build the mempalace_search MCP tool arguments dict.
 
     Param-name fidelity matters: the MCP tool's input_schema declares
-    ``limit`` and ``kind``, and unknown keys are silently dropped by the
+    ``limit`` and unknown keys are silently dropped by the
     schema-whitelist filter in ``mempalace.mcp_server.handle_request``.
     Earlier daemon versions passed ``max_results`` here, which never
     bound and quietly capped every /search response at the default 5.
     """
-    if kind not in _VALID_KINDS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"kind must be one of {_VALID_KINDS}; got {kind!r}",
-        )
-    return {"query": query, "limit": limit, "kind": kind}
+    return {"query": query, "limit": limit}
 
 
 @app.get("/search")
 async def search(
     q: str,
     limit: int = 5,
-    kind: str = "content",
     x_api_key: str | None = Header(default=None),
 ):
-    """Semantic search. ``kind`` defaults to ``"content"`` which excludes
-    Stop-hook auto-save checkpoints (session-summary noise that drowns
-    out real content under vector similarity). Pass ``kind="all"`` to
-    preserve pre-2026-04-25 behavior, or ``kind="checkpoint"`` for
-    recovery/audit lookups."""
+    """Semantic search over the main `mempalace_drawers` collection.
+    Stop-hook auto-save checkpoints live in the dedicated
+    `mempalace_session_recovery` collection and are not surfaced here —
+    use the `mempalace_session_recovery_read` MCP tool for those."""
     _check_auth(x_api_key)
     result = await _call({
         "jsonrpc": "2.0", "id": 1,
         "method": "tools/call",
-        "params": {"name": "mempalace_search", "arguments": _search_args(q, limit, kind)},
+        "params": {"name": "mempalace_search", "arguments": _search_args(q, limit)},
     })
     return _unwrap(result)
 
@@ -446,16 +436,15 @@ async def search(
 async def context(
     topic: str,
     limit: int = 5,
-    kind: str = "content",
     x_api_key: str | None = Header(default=None),
 ):
     """Alias for /search with a semantically friendlier name for LLM tool
-    prompts. Same ``kind`` semantics as /search."""
+    prompts."""
     _check_auth(x_api_key)
     result = await _call({
         "jsonrpc": "2.0", "id": 1,
         "method": "tools/call",
-        "params": {"name": "mempalace_search", "arguments": _search_args(topic, limit, kind)},
+        "params": {"name": "mempalace_search", "arguments": _search_args(topic, limit)},
     })
     return _unwrap(result)
 
