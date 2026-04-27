@@ -52,8 +52,10 @@ set_mode_remote() {
         exit 1
     fi
     if [ -z "$DEFAULT_KEY" ]; then
-        echo "error: no PALACE_API_KEY — set it in env (e.g., source ~/.config/palace-daemon/env)" >&2
-        exit 1
+        # Auth-less daemon is a valid setup — server-side _check_auth only
+        # enforces when its own PALACE_API_KEY is set. Warn but proceed.
+        echo "warning: PALACE_API_KEY not set — proceeding without auth header" >&2
+        echo "  if the daemon at $url enforces auth, the client will get 401s." >&2
     fi
     python3 - <<PY
 import json

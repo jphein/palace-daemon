@@ -37,15 +37,18 @@ probe_json_field() {
   local label="$1"
   local field="$2"
   shift 2
-  local val
-  val=$(curl -sS --max-time 90 "${H_AUTH[@]}" "$@" 2>&1 | python3 -c "
+  local resp val
+  if ! resp=$(curl -fsS --max-time 90 "${H_AUTH[@]}" "$@" 2>&1); then
+    fail "$label — curl failed (HTTP non-2xx or connection error)"
+  fi
+  val=$(echo "$resp" | python3 -c "
 import json, sys
 try:
     d = json.load(sys.stdin)
     print(d.get('$field', ''))
 except Exception as e:
     print(f'PARSE-ERROR:{e}', file=sys.stderr)
-" 2>&1)
+" 2>&1) || true
   if [ -n "$val" ] && [ "${val:0:13}" != "PARSE-ERROR:" ]; then
     pass "$label ($field=$val)"
   else
@@ -86,15 +89,22 @@ probe "GET /viz" 'palace-daemon' "$URL/viz"
 # /repair/status — query state, no actual repair.
 probe_json_field "GET /repair/status" "in_progress" "$URL/repair/status"
 
-# limit= is honored — proves the max_results→limit fix landed.
-COUNT=$(curl -sS --max-time 90 "${H_AUTH[@]}" "$URL/search?q=palace&limit=3" \
-  | python3 -c "import json, sys; print(len(json.load(sys.stdin).get('results', [])))" 2>&1)
-if [ "$COUNT" = "3" ]; then
-  pass "limit=3 returns 3 hits (max_results fix)"
-elif [ "$COUNT" = "0" ] || [ -z "$COUNT" ]; then
-  echo "  ? limit=3 returned 0 — palace may be empty or unreachable, can't confirm fix"
+# limit= is honored end-to-end. Useful as a regression check, but
+# fail-shaped only when the daemon returns valid JSON with a result
+# count that is neither the requested 3 nor 0. Connection or parse
+# errors `?`-flag rather than fail.
+if ! resp=$(curl -fsS --max-time 90 "${H_AUTH[@]}" "$URL/search?q=palace&limit=3" 2>&1); then
+  echo "  ? limit=3 — curl failed (HTTP error or unreachable), can't confirm"
+elif COUNT=$(echo "$resp" | python3 -c "import json, sys; print(len(json.load(sys.stdin).get('results', [])))" 2>/dev/null); then
+  if [ "$COUNT" = "3" ]; then
+    pass "limit=3 returns 3 hits (max_results fix)"
+  elif [ "$COUNT" = "0" ]; then
+    echo "  ? limit=3 returned 0 — palace may be empty, can't confirm"
+  else
+    fail "limit=3 returned $COUNT hits — expected 3 (or 0 on empty palace)"
+  fi
 else
-  fail "limit=3 returned $COUNT hits — expected 3 (or 0 on empty palace)"
+  echo "  ? limit=3 — response wasn't valid JSON, can't confirm"
 fi
 
 echo

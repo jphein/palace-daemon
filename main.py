@@ -301,19 +301,25 @@ async def _drain_pending_writes() -> int:
     return count
 
 
-def _canonical_topic(topic: str) -> str:
+def _canonical_topic(topic) -> str:
     """Canonicalize a Stop-hook checkpoint topic at the daemon boundary.
 
-    All canonical and synonym values become ``CHECKPOINT_TOPIC``. Any
-    other value is left as-is — the caller may have legitimately used
-    a non-checkpoint topic name on this diary write (e.g. "musings",
-    "decisions") and we shouldn't clobber that.
+    Synonyms become ``CHECKPOINT_TOPIC`` with a warning log so client-side
+    drift is visible. Any other string is left as-is — the caller may
+    have legitimately used a non-checkpoint topic name on this diary
+    write (e.g. "musings", "decisions") and we shouldn't clobber that.
 
-    Defense in depth: clients (clients/hook.py, clients/mempal-fast.py,
-    mempalace.hooks_cli) already write the canonical value; this
-    rewrite catches future drift or buggy callers without rejecting the
-    save outright.
+    Non-string inputs (``None``, numbers, lists from a malformed JSON
+    payload) collapse to ``CHECKPOINT_TOPIC`` with a warning, rather
+    than leaking through to ``tool_diary_write`` and turning a bad
+    client request into an internal type error.
     """
+    if not isinstance(topic, str):
+        _log.warning(
+            "silent-save: non-string topic %r (%s); coercing to %r",
+            topic, type(topic).__name__, CHECKPOINT_TOPIC,
+        )
+        return CHECKPOINT_TOPIC
     if topic in CHECKPOINT_TOPIC_SYNONYMS:
         _log.warning(
             "silent-save: rewriting non-canonical checkpoint topic %r → %r",
@@ -699,7 +705,12 @@ def _read_wings_rooms_direct() -> tuple[dict[str, int], list[dict]]:
     finally:
         conn.close()
 
-    rooms = [{"wing": w, "rooms": rooms_by_wing.get(w, {})} for w in wings]
+    # Iterate the union of wings + rooms_by_wing keys, not just `wings`,
+    # so a partial schema-drift (wings query OperationalError-ed but the
+    # rooms-per-wing query succeeded, or vice versa) doesn't silently
+    # drop the half that worked.
+    all_wings = set(wings) | set(rooms_by_wing)
+    rooms = [{"wing": w, "rooms": rooms_by_wing.get(w, {})} for w in sorted(all_wings)]
     return wings, rooms
 
 
@@ -799,8 +810,17 @@ async def graph(x_api_key: str | None = Header(default=None)):
     # bypasses the fan-out entirely.
     graph_stats_task = _call(_mcp("mempalace_graph_stats", {}, 1))
     kg_stats_task    = _call(_mcp("mempalace_kg_stats",    {}, 2))
-    wings_rooms_task = asyncio.to_thread(_read_wings_rooms_direct)
-    kg_direct_task   = asyncio.to_thread(_read_kg_direct)
+
+    # Gate direct-sqlite reads on _read_sem so /graph yields to
+    # /repair mode=rebuild's _exclusive_palace() and respects the
+    # read-concurrency budget (rather than spawning unbounded threads
+    # under load — 2 threads/request × N concurrent /graph requests).
+    async def _direct_under_sem(work):
+        async with _read_sem:
+            return await asyncio.to_thread(work)
+
+    wings_rooms_task = _direct_under_sem(_read_wings_rooms_direct)
+    kg_direct_task   = _direct_under_sem(_read_kg_direct)
 
     graph_stats_resp, kg_stats_resp, (wings, rooms), (kg_entities, kg_triples) = (
         await asyncio.gather(
