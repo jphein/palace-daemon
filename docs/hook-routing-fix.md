@@ -1,5 +1,19 @@
 # Plan: Palace-daemon hook runner + network bootstrap
 
+> **Status:** SHIPPED. `clients/hook.py` was added 2026-04-24 in
+> [`62425e3`](https://github.com/jphein/palace-daemon/commit/62425e3)
+> ("feat: stdlib hook runner + bootstrap script replacing mempalace
+> hook run") and has been the canonical Stop/PreCompact runner since
+> the v1.4.2 release line. The simpler [`clients/mempal-fast.py`](../clients/mempal-fast.py)
+> followed for cases where the full approval/mine flow isn't needed —
+> `mempal-fast.py` only counts exchanges and POSTs to `/silent-save`,
+> so cold hook fires can't trigger ChromaDB's HNSW SIGSEGV class.
+>
+> Both runners are stdlib-only, no `mempalace` import. The original
+> motivation (Part 0–4 below) is preserved as historical context;
+> the Setup section in [`README.md`](../README.md#plugin-client-setup)
+> is the canonical operator-facing reference.
+
 ## Context
 Stop/precompact hooks currently call `mempalace hook run`, which:
 1. Spawns `mempalace mine` as a direct subprocess (bypasses daemon, causes split-brain)

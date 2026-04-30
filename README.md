@@ -10,9 +10,9 @@
 
 Fork of [rboarescu/palace-daemon](https://github.com/rboarescu/palace-daemon), tracking `upstream/main` through the 2026-04-27 sync (upstream is at [v1.5.1](https://github.com/rboarescu/palace-daemon/commit/d0aabb9); this fork is at v1.7.2 with the additional `/graph` endpoint, `/viz` status dashboard, auto-repair-on-startup, and the post-merge deployment tooling). Running in production since 2026-04-24, currently fronting the [jphein/mempalace](https://github.com/jphein/mempalace) **150,891-drawer** canonical palace on [`disks.jphe.in:8085`](https://palace.jphe.in/health). The bulk of the v1.5.0 daemon work (cold-start warmup, `/repair`, `/silent-save`, themed messages, `--palace` flag, MCP timeout) was contributed back to upstream as [PR #4](https://github.com/rboarescu/palace-daemon/pull/4); rboarescu cherry-picked the contents into upstream `main` directly as [`ef6ac03`](https://github.com/rboarescu/palace-daemon/commit/ef6ac03) on 2026-04-25 and closed the PR.
 
-What this fork adds that you won't get from upstream yet: a **`GET /viz` status dashboard** (self-contained HTML page that fetches `/graph`, `/repair/status`, and `/health` in parallel and renders five panels — status strip with repair pulse, D3 force-directed knowledge graph, Mermaid wing/room hierarchy, tunnels list, wings bar chart — D3 + Mermaid via CDN, no static-file deps); a **`GET /graph` endpoint** (single-shot structural snapshot for SME-style consumers, ~0.4s on the 151K-drawer palace via direct read-only sqlite reads of `embedding_metadata` and `knowledge_graph.sqlite3` — vs. ~60-120s for the equivalent serial MCP composition under load); **auto-repair-on-startup** that detects degraded HNSW recall after restart and fires `/repair {mode:rebuild}` non-blocking in the background (workaround that bought time for the mempalace fork's `645ba20` integrity gate fix to land); the **`limit=` parameter actually being honored** (earlier versions silently capped at 5 due to a max_results→limit name mismatch the MCP tool's whitelist dropped); a **`scripts/deploy.sh`** that bundles `git push → wait for sync → systemctl restart → /health poll → verify-routes smoke test` into one command; **`scripts/verify-routes.sh`** as a curl-based smoke test for every public route; **`clients/palace-mode`** CLI for one-command local↔remote palace switching; **`clients/palace-mcp-dispatch.sh`** that picks daemon vs. in-process MCP based on `PALACE_DAEMON_URL`; and **`clients/mempal-fast.py`** — a stdlib-only Stop/PreCompact hook handler that POSTs to `/silent-save` without importing mempalace (so cold hook fires can't trigger ChromaDB's HNSW SIGSEGV class). Full list below.
+What this fork adds that you won't get from upstream yet: a **`GET /viz` status dashboard** (self-contained HTML page that fetches `/graph`, `/repair/status`, and `/health` in parallel and renders five panels — status strip with repair pulse, D3 force-directed knowledge graph, Mermaid wing/room hierarchy, tunnels list, wings bar chart — D3 + Mermaid via CDN, no static-file deps); a **`GET /graph` endpoint** (single-shot structural snapshot for SME-style consumers, ~0.4s on the 151K-drawer palace via direct read-only sqlite reads of `embedding_metadata` and `knowledge_graph.sqlite3` — vs. ~60-120s for the equivalent serial MCP composition under load); **`GET /list`** for query-free metadata browse by wing/room (wraps `mempalace_list_drawers`, the right path when `/search` would fall back to BM25 and ignore the wing filter); **`DELETE /memory/{id}` + `PATCH /memory/{id}`** REST CRUD over `mempalace_delete_drawer` / `mempalace_update_drawer` so curation UIs don't have to talk MCP just to fix a typo; **lifespan auto-migrate** of pre-3.3.4 Stop-hook checkpoints into `mempalace_session_recovery` on first restart post-upgrade (idempotent, ImportError-gated, env-overridable via `PALACE_AUTO_MIGRATE_CHECKPOINTS=0`); **auto-repair-on-startup** that detects degraded HNSW recall after restart and fires `/repair {mode:rebuild}` non-blocking in the background (workaround that bought time for the mempalace fork's `645ba20` integrity gate fix to land); the **`limit=` parameter actually being honored** (earlier versions silently capped at 5 due to a max_results→limit name mismatch the MCP tool's whitelist dropped); a **`scripts/deploy.sh`** that bundles `git push → wait for sync → systemctl restart → /health poll → verify-routes smoke test` into one command; **`scripts/verify-routes.sh`** as a curl-based smoke test for every public route; **`clients/palace-mode`** CLI for one-command local↔remote palace switching; **`clients/palace-mcp-dispatch.sh`** that picks daemon vs. in-process MCP based on `PALACE_DAEMON_URL`; and **`clients/mempal-fast.py`** — a stdlib-only Stop/PreCompact hook handler that POSTs to `/silent-save` without importing mempalace (so cold hook fires can't trigger ChromaDB's HNSW SIGSEGV class). Full list below.
 
-[v1.7.2 release notes](CHANGELOG.md) · [PR #4 — upstream contribution](https://github.com/rboarescu/palace-daemon/pull/4) · [Discussion #5 — Postgres backend](https://github.com/rboarescu/palace-daemon/discussions/5) · [Discussion #6 — TS rewrite heads-up](https://github.com/rboarescu/palace-daemon/discussions/6) · [`docs/event-log-frame.md`](docs/event-log-frame.md) — daemon-as-view-coordinator architectural frame
+[v1.7.2 release notes](CHANGELOG.md) · [PR #4 — upstream contribution](https://github.com/rboarescu/palace-daemon/pull/4) · [Discussion #5 — Postgres backend](https://github.com/rboarescu/palace-daemon/discussions/5) · [Discussion #6 — TS rewrite heads-up](https://github.com/rboarescu/palace-daemon/discussions/6) · [`docs/event-log-frame.md`](docs/event-log-frame.md) — daemon-as-view-coordinator architectural frame · [`docs/typescript-port-plan.md`](docs/typescript-port-plan.md) — TS rewrite planning artifact (no commitments, sections marked `[OPEN]`/`[LEANING]`/`[DECIDED]`)
 
 ## Open upstream PRs
 
@@ -38,6 +38,13 @@ Per [PR #4 issue comment](https://github.com/rboarescu/palace-daemon/pull/4#issu
 ### Recently landed in upstream
 
 - **[PR #4](https://github.com/rboarescu/palace-daemon/pull/4)** (cherry-picked into upstream `main` as [`ef6ac03`](https://github.com/rboarescu/palace-daemon/commit/ef6ac03), 2026-04-25, then closed): cold-start warmup, `/repair`, `/silent-save`, themed messages, `--palace` flag, MCP timeout. The bulk of the v1.5.0 daemon work originated here.
+
+### Cross-repo coordination
+
+The daemon depends on a tiny mempalace patch that's also in flight upstream:
+
+- **[MemPalace/mempalace#1286](https://github.com/MemPalace/mempalace/pull/1286)** — `fix(mcp_server): log exception + retry once on _get_collection failure` (filed 2026-04-30, against `develop`). Currently applied locally as `patches/mcp_server_get_collection.patch` via [`scripts/apply_patches.sh`](scripts/apply_patches.sh) on every `pipx upgrade mempalace`. Once #1286 merges, the patch retires entirely (delete the file, drop the apply step from the upgrade workflow).
+- **[MemPalace/mempalace#1142](https://github.com/MemPalace/mempalace/pull/1142)** — `docs: add RELEASING.md with mempalace-mcp pre-release check` (filed 2026-04-23, against `develop`). Process doc, no daemon dependency.
 
 ## Fork change queue
 
@@ -164,7 +171,8 @@ The architectural argument for why those pieces survive backend swaps (chroma �
 
 ### Requirements
 - Python 3.12+
-- mempalace (the [fork](https://github.com/jphein/mempalace) recommended for the `kind=` searcher filter and daemon-strict hook mode)
+- mempalace ≥ 3.3.2 — the [fork](https://github.com/jphein/mempalace) is recommended if you want daemon-strict hook mode (single-writer enforcement) and the warnings/sqlite-fallback search path that aren't yet on `MemPalace/mempalace develop`. Stock mempalace works for everything else; the fork-only `migrate_checkpoints_to_recovery` lifespan call is `ImportError`-gated and degrades cleanly.
+- For the local mempalace patch (`patches/mcp_server_get_collection.patch` — log + retry on `_get_collection` failure, in flight upstream as [#1286](https://github.com/MemPalace/mempalace/pull/1286)): re-apply with `scripts/apply_patches.sh` after each `pipx upgrade mempalace` until #1286 merges.
 
 ### Install
 
@@ -223,12 +231,15 @@ This installs `mempal-fast.py` as the Stop/PreCompact hook handler and `palace-m
 | `/health` | GET | Liveness + version |
 | `/search` | GET | Semantic search over `mempalace_drawers`; `limit=N`. (Stop-hook checkpoints live in `mempalace_session_recovery` — read via the `mempalace_session_recovery_read` MCP tool.) |
 | `/context` | GET | Same as `/search`, formatted for LLM prompts |
+| `/list` | GET | Query-free metadata browse — wraps `mempalace_list_drawers`. `wing=…&room=…&limit=N&offset=N`, all optional |
 | `/stats` | GET | Aggregate KG + graph + status counts |
 | `/graph` | GET | Single-shot structural snapshot (wings, rooms, tunnels, KG) — see [`docs/graph-endpoint.md`](docs/graph-endpoint.md) |
 | `/viz` | GET | Self-contained HTML status dashboard (D3 + Mermaid). Optional `?refresh=N`, `?key=…` |
 | `/repair` | POST | Coordinate repair (`mode=light\|scan\|prune\|rebuild`) |
 | `/repair/status` | GET | Current repair state + pending-writes queue depth |
 | `/silent-save` | POST | Stop-hook save path with queue-and-drain during rebuild |
+| `/memory/{id}` | DELETE | Drop a drawer — wraps `mempalace_delete_drawer` |
+| `/memory/{id}` | PATCH | Update drawer `content` / `wing` / `room` (all optional in body) — wraps `mempalace_update_drawer` |
 | `/mine` | POST | Bulk import a directory (validated absolute path only) |
 | `/flush` | POST | Force checkpoint of pending writes |
 | `/reload` | POST | Invalidate cached client + collection |
@@ -260,6 +271,7 @@ palace-mode {status,local,remote [URL],install,verify}
 - [pgvector](https://github.com/pgvector/pgvector) — vector extension for postgres, candidate semantic-search view technology under upstream MemPalace [#665](https://github.com/MemPalace/mempalace/pull/665)
 - [D3.js](https://d3js.org/) + [Mermaid](https://mermaid.js.org/) — `/viz` dashboard rendering, both via CDN, no bundler / no static-asset deps
 - Upstream PRs that informed `/viz`: [#1022](https://github.com/MemPalace/mempalace/pull/1022) (D3 KG viz, sangeethkc), [#393](https://github.com/MemPalace/mempalace/pull/393) (Mermaid in docs, jravas), [#431](https://github.com/MemPalace/mempalace/pull/431) (CLI stats, MiloszPodsiadly), [#256](https://github.com/MemPalace/mempalace/pull/256) (sync_status MCP, rusel95), [#601](https://github.com/MemPalace/mempalace/pull/601) (brief overview, mvanhorn) — synthesized, not cherry-picked
+- Cross-repo PRs that retire local code paths if/when they merge: [MemPalace/mempalace#1286](https://github.com/MemPalace/mempalace/pull/1286) — log + retry on `_get_collection` failure (would retire `patches/mcp_server_get_collection.patch`)
 
 ## License
 

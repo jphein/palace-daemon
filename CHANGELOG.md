@@ -1,5 +1,15 @@
 # Changelog
 
+## [Unreleased]
+
+### Maintenance
+- `patches/mcp_server_get_collection.patch` reduced to just the "log exception + retry once on cache failure" slice. The `hnsw:num_threads=1` enforcement portion landed upstream via `_pin_hnsw_threads()` in `mempalace/mcp_server.py` and is no longer carried locally. Daemon behaviour is unchanged. The remaining slice is filed upstream as [MemPalace/mempalace#1286](https://github.com/MemPalace/mempalace/pull/1286); once that merges the patch retires entirely.
+
+### Docs
+- `docs/typescript-port-plan.md` — planning artifact for the prospective TypeScript port (no commitments; sections marked `[OPEN]`/`[LEANING]`/`[DECIDED]`). Triggered by Ben's 2026-04-21 Discord note that the next canonical mempalace is being rewritten in TS, plus the architectural argument in `docs/event-log-frame.md` that the daemon's role (materialized-view coordinator over the event log) is naturally portable.
+- `docs/hook-routing-fix.md` — added a `Status: SHIPPED` header pointing at `62425e3` (2026-04-24, when `clients/hook.py` was added) and clarifying that `clients/mempal-fast.py` is the simpler successor for cases that don't need the full approval/mine flow.
+- README — four new rows in the **Open upstream PRs** table for PRs [#15](https://github.com/rboarescu/palace-daemon/pull/15) (`/viz`), [#16](https://github.com/rboarescu/palace-daemon/pull/16) (`/list`), [#17](https://github.com/rboarescu/palace-daemon/pull/17) (`DELETE/PATCH /memory`), and [#18](https://github.com/rboarescu/palace-daemon/pull/18) (lifespan auto-migrate), all filed 2026-04-30. PR #13 was also rebased onto `upstream/main` on 2026-04-30 to clear a `CHANGELOG.md` conflict with upstream's `b4aee82` patch sync — branch state went `CONFLICTING` → `MERGEABLE / CLEAN`. **Pending PRs queue** (under "Fork change queue") is now empty: every generalisable change ahead of `upstream/main` is an open PR.
+
 ## [1.7.2] - 2026-04-27
 
 ### Pulled in from upstream/main (rboarescu's v1.5.1, sync 2026-04-27)
