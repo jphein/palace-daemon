@@ -694,20 +694,36 @@ _VIZ_HTML_CACHE: str | None = None
 
 
 @app.get("/viz", response_class=HTMLResponse)
-async def viz():
+async def viz(
+    key: str | None = None,
+    x_api_key: str | None = Header(default=None),
+):
     """Self-contained status dashboard at /viz.
 
-    Returns the HTML page from static/viz.html. The page client-side fetches
-    /graph, /repair/status, and /health in parallel and renders five panels:
+    Returns the HTML page from static/viz.html. The page then fetches
+    /graph, /repair/status, and /health client-side and renders five panels:
     KG force-graph (D3), wings bar chart, wing/room hierarchy (Mermaid),
-    tunnels list, KG stats. Auth happens on the data endpoints — the HTML
-    shell itself is public so /viz?key=... in the URL works for ergonomic
-    bookmarking. Cached at module load to avoid disk reads per request.
+    tunnels list, KG stats.
+
+    Auth: same as every other endpoint — ``X-Api-Key`` header. As an
+    ergonomic shortcut for browser bookmarking, ``?key=...`` is also
+    accepted; the page reads it from the URL and re-supplies it to the
+    data endpoints. The ``?key=...`` shape leaks the key into browser
+    history, proxy logs, and referer headers — prefer the header for
+    anything beyond a personal bookmark.
+
+    The HTML template is read from disk lazily on the first request and
+    cached in-process thereafter (one disk read per daemon process).
 
     Inspired by upstream PRs #1022 (D3 KG viz), #393 (Mermaid diagrams),
     #431 (CLI stats), #256 (sync_status MCP), #601 (brief overview) — none
     cherry-picked, just patterns synthesized over the daemon's /graph.
     """
+    # Accept the API key from either the X-Api-Key header (preferred) or
+    # the ?key= query parameter (bookmarkable). _check_auth is a no-op
+    # when PALACE_API_KEY is unset, so this preserves the
+    # zero-config-local-dev experience.
+    _check_auth(x_api_key or key)
     global _VIZ_HTML_CACHE
     if _VIZ_HTML_CACHE is None:
         try:
