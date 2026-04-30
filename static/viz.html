@@ -35,8 +35,22 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>palace-daemon — viz</title>
   <link rel="icon" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='28'>◈</text></svg>" />
-  <script src="https://d3js.org/d3.v7.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <!--
+    CDN scripts are pinned to specific versions and verified via SRI so a
+    compromised CDN response can't run arbitrary JS in the dashboard.
+    `crossorigin="anonymous"` is required for SRI to work on cross-origin
+    scripts. Bump the version + integrity hash together when upgrading.
+  -->
+  <script
+    src="https://cdn.jsdelivr.net/npm/d3@7.8.5/dist/d3.min.js"
+    integrity="sha384-su5kReKyYlIFrI62mbQRKXHzFobMa7BHp1cK6julLPbnYcCW9NIZKJiTODjLPeDh"
+    crossorigin="anonymous"
+    referrerpolicy="no-referrer"></script>
+  <script
+    src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"
+    integrity="sha384-WmdflGW9aGfoBdHc4rRyWzYuAjEmDwMdGdiPNacbwfGKxBW/SO6guzuQ76qjnSlr"
+    crossorigin="anonymous"
+    referrerpolicy="no-referrer"></script>
   <style>
     :root {
       --bg:        #0a0e14;
@@ -218,6 +232,12 @@ const PALETTE = {
 //------------------------------------------------------------------ params + auth
 const params = new URLSearchParams(location.search);
 const REFRESH_SECONDS = parseInt(params.get("refresh") || "0", 10);
+// `?key=...` is supported as a bookmarkable shortcut for the API key. This
+// is convenient but the key will appear in the browser's history, in any
+// referer header sent to a third-party origin, and in the access logs of
+// any forward proxy or reverse proxy on the path. **Do not use ?key= when
+// the dashboard might be screen-shared, screencast, or proxied through a
+// shared intermediary.** Prefer the `X-Api-Key` header for those cases.
 const KEY = params.get("key") || "";
 
 function withAuth(opts) {
@@ -341,9 +361,15 @@ function renderKGStats(graph) {
 
 // Mermaid label sanitizer — allow only chars that don't blow up the parser.
 // (Mermaid escapes its own labels but a label containing `]` or `"` will
-// terminate the node definition early.)
+// terminate the node definition early.) Also strips ASCII control chars
+// (newline, carriage return, tab, etc.) since Mermaid's label parser
+// breaks on raw newlines and we'd rather collapse than render half a
+// label on each side of the break.
 function mermaidSafe(s) {
-  return String(s == null ? "" : s).replace(/["\[\]<>|`]/g, "_").slice(0, 60);
+  return String(s == null ? "" : s)
+    .replace(/[\x00-\x1f\x7f]/g, "_")  // ASCII control chars (incl. \n \r \t)
+    .replace(/["\[\]<>|`]/g, "_")
+    .slice(0, 60);
 }
 
 function renderHierarchy(graph) {
@@ -371,8 +397,12 @@ function renderHierarchy(graph) {
   target.textContent = lines.join("\n");
   if (window.mermaid && mermaid.run) {
     mermaid.run({ querySelector: "#hierarchy" }).catch(e => {
+      // The target is a <pre>; appending a <div> here would be invalid HTML.
+      // Surface the failure as plain text inside the existing element and
+      // tag the container so CSS can style it as an error if desired.
       clear(target);
-      target.appendChild(el("div", { class: "err" }, "mermaid render failed: " + e.message));
+      target.classList.add("err");
+      target.textContent = "mermaid render failed: " + (e && e.message ? e.message : e);
     });
   }
 }
@@ -466,10 +496,15 @@ async function loadAll() {
 
 document.addEventListener("DOMContentLoaded", () => {
   if (window.mermaid) {
+    // securityLevel "strict" is the default and the safe choice — it sandboxes
+    // labels through Mermaid's HTML escaping and disables click handlers on
+    // diagram nodes. We never need clickable nodes here (this is a read-only
+    // visual of /graph), and our labels are already sanitised by mermaidSafe()
+    // before they reach the diagram. Using "loose" was over-permissive.
     mermaid.initialize({
       startOnLoad: false,
       theme: matchMedia("(prefers-color-scheme: light)").matches ? "default" : "dark",
-      securityLevel: "loose",
+      securityLevel: "strict",
     });
   }
   loadAll();
