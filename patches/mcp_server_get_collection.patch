@@ -1,6 +1,6 @@
 --- a/mempalace/mcp_server.py
 +++ b/mempalace/mcp_server.py
-@@ -277,39 +277,55 @@
+@@ -272,39 +272,57 @@
  
  
  def _get_collection(create=False):
@@ -25,10 +25,11 @@
 -                },
 +    """Return the ChromaDB collection, caching the client between calls.
 +
-+    Retries once on failure after clearing client/collection caches so a
-+    stale cache (e.g. left behind after a transient ChromaDB error) can
-+    self-heal without a daemon restart. Logs the exception so failures
-+    surface in the daemon log instead of silently returning None.
++    On failure, log the exception (so the operator can see what broke
++    instead of a silent ``None``) and retry once after clearing the
++    client/collection caches — this lets a stale cache, e.g. left
++    behind after a transient ChromaDB error, self-heal on the next
++    tool call rather than requiring a process restart.
 +    """
 +    global _client_cache, _collection_cache, _metadata_cache, _metadata_cache_time
 +    for attempt in range(2):
@@ -61,10 +62,11 @@
 +                _metadata_cache = None
 +                _metadata_cache_time = 0
 +            return _collection_cache
-+        except Exception as e:
-+            logger.error(
-+                "_get_collection attempt %d failed (palace=%s): %s",
-+                attempt + 1, _config.palace_path, e,
++        except Exception:
++            logger.exception(
++                "_get_collection attempt %d failed (palace=%s)",
++                attempt + 1,
++                _config.palace_path,
              )
 -            _pin_hnsw_threads(raw)
 -            _collection_cache = ChromaCollection(raw)
@@ -87,4 +89,4 @@
 +    return None
  
  
- def _get_session_recovery_collection(create=False):
+ def _no_palace():

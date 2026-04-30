@@ -403,8 +403,9 @@ async def lifespan(app: FastAPI):
     # so they don't dominate vector top-N. Idempotent — re-runs return 0
     # once the canonical palace has reorganized. Gated behind
     # PALACE_AUTO_MIGRATE_CHECKPOINTS so operators can disable in
-    # environments where the one-time migration cost is unwanted.
-    # See mempalace docs/superpowers/specs/2026-04-25-checkpoint-collection-split.md.
+    # environments where the one-time migration cost is unwanted. The
+    # migration shape is also exposed via `mempalace repair --mode reorganize`
+    # for explicit operator-driven runs.
     if os.environ.get("PALACE_AUTO_MIGRATE_CHECKPOINTS", "1") != "0":
         try:
             from mempalace.migrate import migrate_checkpoints_to_recovery
@@ -419,11 +420,21 @@ async def lifespan(app: FastAPI):
                     "mempalace_search now queries content-only.",
                     moved_checkpoints,
                 )
-        except ImportError:
-            # mempalace.migrate.migrate_checkpoints_to_recovery is fork-side
-            # only at the moment; on upstream-shaped installs without it the
-            # daemon should still start cleanly.
-            logger.debug("migrate_checkpoints_to_recovery not available; skipping auto-migrate.")
+        except ImportError as e:
+            # Distinguish "mempalace.migrate or migrate_checkpoints_to_recovery
+            # genuinely unavailable on this mempalace release line" (feature
+            # gating, expected) from "import failed for some other reason
+            # — e.g. a transitive dep missing inside mempalace.migrate"
+            # (real error, surface at warning level).
+            if getattr(e, "name", None) == "mempalace.migrate":
+                logger.debug(
+                    "mempalace.migrate not available on this release; skipping auto-migrate."
+                )
+            else:
+                logger.warning(
+                    "Auto-migrate skipped — unexpected ImportError from mempalace.migrate: %s",
+                    e,
+                )
         except Exception as e:
             logger.warning("Auto-migrate of checkpoints failed (non-fatal): %s", e)
 
@@ -563,12 +574,16 @@ async def list_drawers(
     Wraps mempalace's ``mempalace_list_drawers`` MCP tool. Unlike /search,
     this is an unranked listing pulled directly from sqlite metadata, so
     it's the right path for browsing a wing without an embeddable query
-    (e.g. familiar's reflect-memories panel which wants "all drawers in
-    wing=reflect" sorted by recency).
+    (e.g. a "show me everything in wing=reflect" panel that just wants
+    a flat list, not a vector top-N).
 
-    Either ``wing`` or ``room`` (or both) should be supplied; with neither,
-    returns the first ``limit`` drawers across the whole palace, ordered
-    by mempalace's natural metadata-table order.
+    Ordering is whatever ``mempalace_list_drawers`` returns — currently
+    the natural sqlite metadata-table order, which approximates insertion
+    order but is not guaranteed to be strictly chronological. Pass
+    ``limit`` / ``offset`` for pagination.
+
+    Either ``wing`` or ``room`` (or both) can be supplied; with neither,
+    returns the first ``limit`` drawers across the whole palace.
     """
     _check_auth(x_api_key)
     args: dict = {"limit": int(limit), "offset": int(offset)}
@@ -598,13 +613,29 @@ async def delete_memory(drawer_id: str, x_api_key: str | None = Header(default=N
 
 @app.patch("/memory/{drawer_id}")
 async def update_memory(drawer_id: str, request: Request, x_api_key: str | None = Header(default=None)):
-    """Update a drawer's content/wing/room. Wraps mempalace_update_drawer."""
+    """Update a drawer's content/wing/room. Wraps mempalace_update_drawer.
+
+    Body keys (all optional, but at least one is required): ``content``,
+    ``wing``, ``room``. Only supplied keys are forwarded to the underlying
+    tool. An empty body returns 400 — that's an ambiguous no-op rather
+    than something we should silently let through to mempalace.
+    """
     _check_auth(x_api_key)
-    body = await request.json()
+    try:
+        body = await request.json()
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="Request body must be valid JSON.") from exc
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Request body must be a JSON object.")
     args: dict = {"drawer_id": drawer_id}
     if "content" in body: args["content"] = body["content"]
     if "wing" in body: args["wing"] = body["wing"]
     if "room" in body: args["room"] = body["room"]
+    if len(args) == 1:
+        raise HTTPException(
+            status_code=400,
+            detail="PATCH /memory/{id} requires at least one of: content, wing, room.",
+        )
     result = await _call({
         "jsonrpc": "2.0", "id": 1,
         "method": "tools/call",
