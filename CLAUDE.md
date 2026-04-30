@@ -27,4 +27,4 @@ After `pipx upgrade mempalace`, always re-apply local patches and restart:
 If a patch conflicts, the script will say so. Check whether upstream fixed the issue — if so, delete the patch file. Otherwise update the patch to match the new code.
 
 Patches live in `patches/`. Current patches:
-- `mcp_server_get_collection.patch` — `_get_collection`: exception logging, auto-retry on cache failure, `hnsw:num_threads=1` enforcement (workaround for ChromaDB issue #1161)
+- `mcp_server_get_collection.patch` — `_get_collection`: exception logging + auto-retry on cache failure (clears `_client_cache` / `_collection_cache` between attempts so a stale cache self-heals without a daemon restart). The original `hnsw:num_threads=1` portion landed upstream via `_pin_hnsw_threads()` and is no longer in this patch.
