@@ -470,12 +470,16 @@ async def list_drawers(
     Wraps mempalace's ``mempalace_list_drawers`` MCP tool. Unlike /search,
     this is an unranked listing pulled directly from sqlite metadata, so
     it's the right path for browsing a wing without an embeddable query
-    (e.g. familiar's reflect-memories panel which wants "all drawers in
-    wing=reflect" sorted by recency).
+    (e.g. a "show me everything in wing=reflect" panel that just wants
+    a flat list, not a vector top-N).
 
-    Either ``wing`` or ``room`` (or both) should be supplied; with neither,
-    returns the first ``limit`` drawers across the whole palace, ordered
-    by mempalace's natural metadata-table order.
+    Ordering is whatever ``mempalace_list_drawers`` returns — currently
+    the natural sqlite metadata-table order, which approximates insertion
+    order but is not guaranteed to be strictly chronological. Pass
+    ``limit`` / ``offset`` for pagination.
+
+    Either ``wing`` or ``room`` (or both) can be supplied; with neither,
+    returns the first ``limit`` drawers across the whole palace.
     """
     _check_auth(x_api_key)
     args: dict = {"limit": int(limit), "offset": int(offset)}
