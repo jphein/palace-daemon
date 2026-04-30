@@ -364,8 +364,9 @@ async def lifespan(app: FastAPI):
     # so they don't dominate vector top-N. Idempotent — re-runs return 0
     # once the canonical palace has reorganized. Gated behind
     # PALACE_AUTO_MIGRATE_CHECKPOINTS so operators can disable in
-    # environments where the one-time migration cost is unwanted.
-    # See mempalace docs/superpowers/specs/2026-04-25-checkpoint-collection-split.md.
+    # environments where the one-time migration cost is unwanted. The
+    # migration shape is also exposed via `mempalace repair --mode reorganize`
+    # for explicit operator-driven runs.
     if os.environ.get("PALACE_AUTO_MIGRATE_CHECKPOINTS", "1") != "0":
         try:
             from mempalace.migrate import migrate_checkpoints_to_recovery
@@ -380,11 +381,21 @@ async def lifespan(app: FastAPI):
                     "mempalace_search now queries content-only.",
                     moved_checkpoints,
                 )
-        except ImportError:
-            # mempalace.migrate.migrate_checkpoints_to_recovery is fork-side
-            # only at the moment; on upstream-shaped installs without it the
-            # daemon should still start cleanly.
-            logger.debug("migrate_checkpoints_to_recovery not available; skipping auto-migrate.")
+        except ImportError as e:
+            # Distinguish "mempalace.migrate or migrate_checkpoints_to_recovery
+            # genuinely unavailable on this mempalace release line" (feature
+            # gating, expected) from "import failed for some other reason
+            # — e.g. a transitive dep missing inside mempalace.migrate"
+            # (real error, surface at warning level).
+            if getattr(e, "name", None) == "mempalace.migrate":
+                logger.debug(
+                    "mempalace.migrate not available on this release; skipping auto-migrate."
+                )
+            else:
+                logger.warning(
+                    "Auto-migrate skipped — unexpected ImportError from mempalace.migrate: %s",
+                    e,
+                )
         except Exception as e:
             logger.warning("Auto-migrate of checkpoints failed (non-fatal): %s", e)
 
