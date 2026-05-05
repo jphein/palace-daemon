@@ -176,6 +176,54 @@ def _check_auth(x_api_key: str | None):
         raise HTTPException(status_code=401, detail="Invalid API key")
 
 
+def _parse_path_map(raw: str | None = None) -> list[tuple[str, str]]:
+    """Parse PALACE_DAEMON_PATH_MAP into ordered (client_prefix, daemon_prefix) pairs.
+
+    Format: comma-separated ``client_prefix=daemon_prefix`` entries. Whitespace
+    around each token is stripped. Empty entries and entries missing ``=`` are
+    skipped silently. Order is preserved so the operator can put more-specific
+    prefixes first.
+
+    Example::
+
+        PALACE_DAEMON_PATH_MAP="/home/jp/.claude/=/mnt/raid/claude-config/,/home/jp/Projects/=/mnt/raid/projects/"
+    """
+    if raw is None:
+        raw = os.environ.get("PALACE_DAEMON_PATH_MAP", "")
+    raw = (raw or "").strip()
+    if not raw:
+        return []
+    pairs: list[tuple[str, str]] = []
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry or "=" not in entry:
+            continue
+        client_prefix, daemon_prefix = entry.split("=", 1)
+        client_prefix = client_prefix.strip()
+        daemon_prefix = daemon_prefix.strip()
+        if client_prefix and daemon_prefix:
+            pairs.append((client_prefix, daemon_prefix))
+    return pairs
+
+
+def _translate_client_path(path: str) -> str:
+    """Translate a client-side absolute path to a daemon-side path.
+
+    Hooks running on a client machine (e.g. katana) speak in their own
+    filesystem namespace (``/home/jp/.claude/...``); the daemon may see the
+    same files at a different mount (``/mnt/raid/claude-config/...`` via
+    Syncthing). ``PALACE_DAEMON_PATH_MAP`` lets the operator declare those
+    rewrites without coupling client code to deployment specifics.
+
+    The first matching prefix wins; non-matching paths pass through
+    unchanged so daemon-side absolute paths still work.
+    """
+    for client_prefix, daemon_prefix in _parse_path_map():
+        if path.startswith(client_prefix):
+            return daemon_prefix + path[len(client_prefix):]
+    return path
+
+
 def _sem_for(request_dict: dict) -> asyncio.Semaphore:
     method = request_dict.get("method", "")
     if method == "ping":
@@ -1013,6 +1061,10 @@ async def mine(request: Request, x_api_key: str | None = Header(default=None)):
     directory = body.get("dir")
     if not directory:
         raise HTTPException(status_code=400, detail="'dir' is required")
+
+    # Hook clients send paths in their own filesystem namespace. Translate
+    # to the daemon's view via PALACE_DAEMON_PATH_MAP before validation.
+    directory = _translate_client_path(directory)
 
     dir_path = Path(directory)
     if not dir_path.is_absolute() or ".." in dir_path.parts:
