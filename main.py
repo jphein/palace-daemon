@@ -176,7 +176,14 @@ def _check_auth(x_api_key: str | None):
         raise HTTPException(status_code=401, detail="Invalid API key")
 
 
-def _parse_path_map(raw: str | None = None) -> list[tuple[str, str]]:
+# Sentinel for "no value passed" — distinguishes _parse_path_map() (read env)
+# from _parse_path_map(None) (no mapping). Closes Copilot's test-isolation
+# concern on jphein/palace-daemon#1: the previous None default coupled tests
+# to whatever PALACE_DAEMON_PATH_MAP happened to be in the test process env.
+_PATH_MAP_USE_ENV: object = object()
+
+
+def _parse_path_map(raw=_PATH_MAP_USE_ENV) -> list[tuple[str, str]]:
     """Parse PALACE_DAEMON_PATH_MAP into ordered (client_prefix, daemon_prefix) pairs.
 
     Format: comma-separated ``client_prefix=daemon_prefix`` entries. Whitespace
@@ -184,11 +191,16 @@ def _parse_path_map(raw: str | None = None) -> list[tuple[str, str]]:
     skipped silently. Order is preserved so the operator can put more-specific
     prefixes first.
 
+    Args:
+        raw: When omitted, reads from ``PALACE_DAEMON_PATH_MAP``. Pass an
+            explicit string (or ``""``/``None``) to bypass env entirely —
+            tests use this to stay deterministic regardless of CI / dev env.
+
     Example::
 
         PALACE_DAEMON_PATH_MAP="/home/jp/.claude/=/mnt/raid/claude-config/,/home/jp/Projects/=/mnt/raid/projects/"
     """
-    if raw is None:
+    if raw is _PATH_MAP_USE_ENV:
         raw = os.environ.get("PALACE_DAEMON_PATH_MAP", "")
     raw = (raw or "").strip()
     if not raw:
@@ -217,10 +229,15 @@ def _translate_client_path(path: str) -> str:
 
     The first matching prefix wins; non-matching paths pass through
     unchanged so daemon-side absolute paths still work.
+
+    Joining is normalized so mismatched trailing/leading slashes between
+    the two prefixes can't produce paths like ``/mnt/raid/ccprojects/...``
+    (Copilot finding on jphein/palace-daemon#1).
     """
     for client_prefix, daemon_prefix in _parse_path_map():
         if path.startswith(client_prefix):
-            return daemon_prefix + path[len(client_prefix):]
+            suffix = path[len(client_prefix):]
+            return daemon_prefix.rstrip("/") + "/" + suffix.lstrip("/")
     return path
 
 
@@ -1061,6 +1078,11 @@ async def mine(request: Request, x_api_key: str | None = Header(default=None)):
     directory = body.get("dir")
     if not directory:
         raise HTTPException(status_code=400, detail="'dir' is required")
+    if not isinstance(directory, str):
+        # Closes Copilot finding on jphein/palace-daemon#1: a JSON number /
+        # object / list would crash _translate_client_path().startswith and
+        # surface as 500 rather than a clean 400.
+        raise HTTPException(status_code=400, detail="'dir' must be a string")
 
     # Hook clients send paths in their own filesystem namespace. Translate
     # to the daemon's view via PALACE_DAEMON_PATH_MAP before validation.

@@ -26,10 +26,15 @@ import main  # noqa: E402
 
 
 class TestParsePathMap(unittest.TestCase):
-    def test_empty_returns_empty(self):
+    def test_empty_string_returns_empty(self):
         self.assertEqual(main._parse_path_map(""), [])
-        self.assertEqual(main._parse_path_map(None), [])
         self.assertEqual(main._parse_path_map("   "), [])
+
+    def test_explicit_none_returns_empty(self):
+        # None now means "no mapping" (does NOT fall back to env). The
+        # sentinel default keeps the env-reading behavior on the no-arg
+        # call below — closes Copilot finding on jphein/palace-daemon#1.
+        self.assertEqual(main._parse_path_map(None), [])
 
     def test_single_pair(self):
         out = main._parse_path_map("/home/u/.claude/=/mnt/raid/claude-config/")
@@ -57,11 +62,17 @@ class TestParsePathMap(unittest.TestCase):
         self.assertEqual(out, [("/a/", "/b/")])
 
     def test_reads_env_var_when_no_arg(self):
+        # No-arg call reads env. clear=True so a stray PALACE_DAEMON_PATH_MAP
+        # in the test process can't taint the assertion.
         with patch.dict(
-            os.environ, {"PALACE_DAEMON_PATH_MAP": "/x/=/y/"}, clear=False
+            os.environ, {"PALACE_DAEMON_PATH_MAP": "/x/=/y/"}, clear=True
         ):
             out = main._parse_path_map()
         self.assertEqual(out, [("/x/", "/y/")])
+
+    def test_env_unset_no_arg_returns_empty(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(main._parse_path_map(), [])
 
 
 class TestTranslateClientPath(unittest.TestCase):
@@ -104,6 +115,45 @@ class TestTranslateClientPath(unittest.TestCase):
             self.assertEqual(
                 main._translate_client_path("/home/u/Projects/realmwatch/foo"),
                 "/mnt/raid/projects/realmwatch/foo",
+            )
+
+    def test_join_normalizes_mismatched_trailing_slash(self):
+        """Closes Copilot finding on jphein/palace-daemon#1: prefixes with
+        mismatched trailing slashes used to produce paths like
+        ``/mnt/raid/ccprojects/...``. Now the join normalizes to exactly
+        one separator regardless of operator slash style.
+        """
+        # client trailing /, daemon no trailing
+        with patch.dict(
+            os.environ, {"PALACE_DAEMON_PATH_MAP": "/home/u/.claude/=/mnt/raid/cc"}, clear=True
+        ):
+            self.assertEqual(
+                main._translate_client_path("/home/u/.claude/projects/-x"),
+                "/mnt/raid/cc/projects/-x",
+            )
+        # client no trailing, daemon trailing /
+        with patch.dict(
+            os.environ, {"PALACE_DAEMON_PATH_MAP": "/home/u/.claude=/mnt/raid/cc/"}, clear=True
+        ):
+            self.assertEqual(
+                main._translate_client_path("/home/u/.claude/projects/-x"),
+                "/mnt/raid/cc/projects/-x",
+            )
+        # both trailing /
+        with patch.dict(
+            os.environ, {"PALACE_DAEMON_PATH_MAP": "/home/u/.claude/=/mnt/raid/cc/"}, clear=True
+        ):
+            self.assertEqual(
+                main._translate_client_path("/home/u/.claude/projects/-x"),
+                "/mnt/raid/cc/projects/-x",
+            )
+        # neither trailing /
+        with patch.dict(
+            os.environ, {"PALACE_DAEMON_PATH_MAP": "/home/u/.claude=/mnt/raid/cc"}, clear=True
+        ):
+            self.assertEqual(
+                main._translate_client_path("/home/u/.claude/projects/-x"),
+                "/mnt/raid/cc/projects/-x",
             )
 
 
