@@ -525,10 +525,61 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(_watchdog_loop(wdog_secs))
         logger.info("Systemd watchdog active (interval=%ds, tick=%ds).", wdog_secs, max(10, wdog_secs // 2))
 
+    # File-watcher service: mines configured directories on file change.
+    # Configured via PALACE_WATCH_DIRS (comma-separated path[=wing]).
+    # Mirrors the pattern used by the /mine endpoint above.
+    app.state.watcher = None
+    try:
+        from watcher import WatcherService, make_async_mine_fn, parse_watch_dirs
+
+        # Translate watch paths from the client namespace to the daemon
+        # namespace BEFORE the is_dir() check. Without this, an env var
+        # written as /home/jp/Projects/... would always be skipped on
+        # the daemon (Copilot finding on jphein/palace-daemon#2).
+        targets = parse_watch_dirs(translator=_translate_client_path)
+        loop = asyncio.get_running_loop()
+
+        async def _internal_mine(path: str, wing: str) -> None:
+            # parse_watch_dirs already translated the path; this guard
+            # catches edge cases (target deleted after startup, etc.).
+            dir_path = Path(path)
+            if not dir_path.is_dir():
+                logger.warning("watcher: skipping mine for non-dir path %s", path)
+                return
+            mempalace_bin = os.path.join(os.path.dirname(sys.executable), "mempalace")
+            argv = [mempalace_bin, "mine", path, "--mode", "projects", "--wing", wing]
+            # Same pattern as /mine endpoint: list-form argv, no shell.
+            async with _mine_sem:
+                proc = await asyncio.create_subprocess_exec(
+                    *argv,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, stderr = await proc.communicate()
+            if proc.returncode != 0:
+                logger.warning("watcher mine returned %s for %s", proc.returncode, path)
+
+        watcher = WatcherService(make_async_mine_fn(loop, _internal_mine))
+        watcher.start(targets)
+        # Only publish the watcher to app.state when it actually started
+        # observing — otherwise GET /watch would report running:true on
+        # an idle/disabled service (Copilot finding on jphein/palace-daemon#2).
+        if watcher.is_running:
+            app.state.watcher = watcher
+    except Exception as e:
+        logger.warning("File-watcher startup failed (non-fatal): %s", e)
+
     yield
     
     # --- Shutdown: Silent Save / Flush ---
     logger.info("Lifespan: shutting down, flushing memories...")
+    try:
+        watcher = getattr(app.state, "watcher", None)
+        if watcher is not None:
+            watcher.stop()
+            logger.info("WatcherService stopped.")
+    except Exception:
+        logger.exception("WatcherService stop failed (non-fatal)")
     try:
         # We call mempalace_memories_filed_away which triggers a checkpoint in recent mempalace versions
         await _call({
@@ -1133,6 +1184,22 @@ async def mine(request: Request, x_api_key: str | None = Header(default=None)):
         "stdout": stdout.decode(),
         "stderr": stderr.decode(),
     }
+
+
+@app.get("/watch")
+async def watch_list(x_api_key: str | None = Header(default=None)):
+    """List the directories the file-watcher is currently monitoring.
+
+    Configured at startup via PALACE_WATCH_DIRS env var; runtime add /
+    remove requires a daemon restart. Returns an empty list when the
+    watcher isn't running (env unset, watchdog package missing, or
+    startup failed).
+    """
+    _check_auth(x_api_key)
+    watcher = getattr(app.state, "watcher", None)
+    if watcher is None:
+        return {"running": False, "targets": []}
+    return {"running": True, "targets": watcher.list_targets()}
 
 
 # ── Repair + silent-save ─────────────────────────────────────────────────────
