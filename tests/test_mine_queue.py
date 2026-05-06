@@ -129,6 +129,62 @@ class TestEnqueueAndDrain(unittest.IsolatedAsyncioTestCase):
         count = await main._drain_pending_mines()
         self.assertEqual(count, 0)
 
+    async def test_drain_replays_extract_and_limit_options(self):
+        """Closes Copilot finding on jphein/palace-daemon#4 — drain
+        previously dropped optional ``extract`` / ``limit`` fields,
+        so a queue entry that included them got replayed without."""
+        await main._enqueue_pending_mine({
+            "dir": "/a", "wing": "wa", "mode": "convos",
+            "extract": "exchange", "limit": 100,
+        })
+
+        captured_argv = []
+
+        async def _fake_subprocess(*args, **kwargs):
+            captured_argv.append(list(args))
+            proc = MagicMock()
+            proc.communicate = AsyncMock(return_value=(b"", b""))
+            proc.returncode = 0
+            return proc
+
+        with patch("asyncio.create_subprocess_exec", side_effect=_fake_subprocess):
+            count = await main._drain_pending_mines()
+
+        self.assertEqual(count, 1)
+        self.assertEqual(len(captured_argv), 1)
+        argv = captured_argv[0]
+        # extract and limit make it onto the replay command
+        self.assertIn("--extract", argv)
+        self.assertEqual(argv[argv.index("--extract") + 1], "exchange")
+        self.assertIn("--limit", argv)
+        self.assertEqual(argv[argv.index("--limit") + 1], "100")
+
+    async def test_drain_skips_invalid_payload_fields(self):
+        """Closes Copilot finding on jphein/palace-daemon#4 — drain
+        previously skipped only is_dir() check; now also enforces
+        the same valid-mode / valid-extract / int-limit / no-traversal
+        guards as the live /mine endpoint."""
+        for bad in (
+            {"dir": "../../etc/passwd", "wing": "wa", "mode": "convos"},  # traversal
+            {"dir": "/a", "wing": "wa", "mode": "wrong-mode"},  # invalid mode
+            {"dir": "/a", "wing": "wa", "mode": "convos", "extract": "wrong"},  # invalid extract
+            {"dir": "/a", "wing": "wa", "mode": "convos", "limit": "not-a-number"},  # invalid limit
+            {"dir": None, "wing": "wa", "mode": "convos"},  # invalid dir type
+        ):
+            await main._enqueue_pending_mine(bad)
+
+        async def _fake_subprocess(*args, **kwargs):
+            proc = MagicMock()
+            proc.communicate = AsyncMock(return_value=(b"", b""))
+            proc.returncode = 0
+            return proc
+
+        with patch("asyncio.create_subprocess_exec", side_effect=_fake_subprocess) as spawn:
+            count = await main._drain_pending_mines()
+        # All five entries skipped, no subprocess spawned, count = 0
+        self.assertEqual(count, 0)
+        self.assertEqual(spawn.call_count, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

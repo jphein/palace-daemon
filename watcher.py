@@ -24,10 +24,10 @@ inotify-backed so the kernel-level efficiency is preserved.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import logging
 import os
 import threading
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -319,18 +319,23 @@ class WatcherService:
         return [{"path": str(t.path), "wing": t.wing} for t in self._targets]
 
 
-def _log_future_exception(future: "asyncio.Future") -> None:
+def _log_future_exception(future: "concurrent.futures.Future") -> None:
     """Surface exceptions raised inside the scheduled mine coroutine.
 
-    `run_coroutine_threadsafe` returns a Future the caller must observe;
-    if the coroutine raises and the Future is dropped, the exception is
-    swallowed silently. Attaching this callback ensures watcher-driven
-    mine failures show up in the daemon log instead of disappearing.
-    Closes Copilot finding on jphein/palace-daemon#2.
+    ``asyncio.run_coroutine_threadsafe`` returns a
+    ``concurrent.futures.Future`` (NOT ``asyncio.Future``) — the
+    callback receives the cross-thread variant. Catch its
+    cancellation/state errors plus the asyncio variants so the
+    callback can't itself crash on a concurrent cancellation.
+    Closes Copilot finding on jphein/palace-daemon#3.
     """
     try:
         exc = future.exception()
-    except (asyncio.CancelledError, asyncio.InvalidStateError):
+    except (
+        concurrent.futures.CancelledError,
+        concurrent.futures.InvalidStateError,
+        asyncio.CancelledError,
+    ):
         return
     if exc is not None:
         _log.error("watcher-scheduled mine raised: %r", exc, exc_info=exc)
