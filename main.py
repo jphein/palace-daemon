@@ -528,20 +528,26 @@ async def lifespan(app: FastAPI):
     # File-watcher service: mines configured directories on file change.
     # Configured via PALACE_WATCH_DIRS (comma-separated path[=wing]).
     # Mirrors the pattern used by the /mine endpoint above.
+    app.state.watcher = None
     try:
         from watcher import WatcherService, make_async_mine_fn, parse_watch_dirs
 
-        targets = parse_watch_dirs()
+        # Translate watch paths from the client namespace to the daemon
+        # namespace BEFORE the is_dir() check. Without this, an env var
+        # written as /home/jp/Projects/... would always be skipped on
+        # the daemon (Copilot finding on jphein/palace-daemon#2).
+        targets = parse_watch_dirs(translator=_translate_client_path)
         loop = asyncio.get_running_loop()
 
         async def _internal_mine(path: str, wing: str) -> None:
-            translated = _translate_client_path(path)
-            dir_path = Path(translated)
+            # parse_watch_dirs already translated the path; this guard
+            # catches edge cases (target deleted after startup, etc.).
+            dir_path = Path(path)
             if not dir_path.is_dir():
-                logger.warning("watcher: skipping mine for non-dir path %s", translated)
+                logger.warning("watcher: skipping mine for non-dir path %s", path)
                 return
             mempalace_bin = os.path.join(os.path.dirname(sys.executable), "mempalace")
-            argv = [mempalace_bin, "mine", translated, "--mode", "projects", "--wing", wing]
+            argv = [mempalace_bin, "mine", path, "--mode", "projects", "--wing", wing]
             # Same pattern as /mine endpoint: list-form argv, no shell.
             async with _mine_sem:
                 proc = await asyncio.create_subprocess_exec(
@@ -551,14 +557,17 @@ async def lifespan(app: FastAPI):
                 )
                 stdout, stderr = await proc.communicate()
             if proc.returncode != 0:
-                logger.warning("watcher mine returned %s for %s", proc.returncode, translated)
+                logger.warning("watcher mine returned %s for %s", proc.returncode, path)
 
         watcher = WatcherService(make_async_mine_fn(loop, _internal_mine))
         watcher.start(targets)
-        app.state.watcher = watcher
+        # Only publish the watcher to app.state when it actually started
+        # observing — otherwise GET /watch would report running:true on
+        # an idle/disabled service (Copilot finding on jphein/palace-daemon#2).
+        if watcher.is_running:
+            app.state.watcher = watcher
     except Exception as e:
         logger.warning("File-watcher startup failed (non-fatal): %s", e)
-        app.state.watcher = None
 
     yield
     

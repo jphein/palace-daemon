@@ -101,12 +101,22 @@ class WatchTarget:
     wing: str
 
 
-def parse_watch_dirs(raw: str | None = None) -> list[WatchTarget]:
+def parse_watch_dirs(
+    raw: str | None = None,
+    translator: Callable[[str], str] | None = None,
+) -> list[WatchTarget]:
     """Parse PALACE_WATCH_DIRS env var into WatchTarget list.
 
     Format: comma-separated entries; each entry is ``path`` or
     ``path=wing``. Entries pointing at non-existent paths are dropped
     with a warning log line so a misconfigured env doesn't kill startup.
+
+    ``translator`` (optional) is applied to each path before the
+    daemon-side ``is_dir()`` check. Operators may write watch paths in
+    the client namespace (``/home/jp/Projects/...``); without translation
+    those would be silently rejected as "not a directory" on the daemon
+    even though the same files live at ``/mnt/raid/projects/...`` via
+    Syncthing. Closes Copilot finding on jphein/palace-daemon#2.
     """
     if raw is None:
         raw = os.environ.get("PALACE_WATCH_DIRS", "")
@@ -128,6 +138,8 @@ def parse_watch_dirs(raw: str | None = None) -> list[WatchTarget]:
             wing = ""
         if not path_str:
             continue
+        if translator is not None:
+            path_str = translator(path_str)
         path = Path(path_str).expanduser().resolve()
         if not path.is_dir():
             _log.warning("PALACE_WATCH_DIRS: skipping %r (not a directory)", path_str)
@@ -143,12 +155,25 @@ def parse_watch_dirs(raw: str | None = None) -> list[WatchTarget]:
     return targets
 
 
+def _has_watchable_extension(path_str: str) -> bool:
+    """Return True if the path has a suffix in the watch allowlist."""
+    try:
+        return Path(path_str).suffix.lower() in _WATCHABLE_EXTENSIONS
+    except Exception:
+        return False
+
+
 class _DebouncedMineHandler(FileSystemEventHandler):
     """Watchdog handler that debounces mine triggers per directory.
 
     A burst of events from an editor's write+rename dance shouldn't fan
     out to N parallel mines. Instead, schedule a single mine per watch
     root, ``_DEBOUNCE_SECONDS`` after the most recent event.
+
+    Subscribes only to write-shaped events (created/modified/moved/deleted);
+    Linux watchdog 3.x emits ``opened``/``closed`` events on plain reads,
+    and routing those through the debounce would re-mine the project on
+    every file open. Closes Copilot finding on jphein/palace-daemon#2.
     """
 
     def __init__(self, target: WatchTarget, mine_fn: Callable[[str, str], None]):
@@ -157,26 +182,48 @@ class _DebouncedMineHandler(FileSystemEventHandler):
         self._timer: threading.Timer | None = None
         self._lock = threading.Lock()
 
-    def on_any_event(self, event: FileSystemEvent) -> None:
-        # Skip directories — we only mine when files change, and the
-        # mempalace miner walks the dir itself anyway.
+    def _maybe_schedule(self, event: FileSystemEvent, *, also_check_dest: bool = False) -> None:
         if event.is_directory:
             return
-        # Skip events outside our extension allowlist. Most modify-storm
-        # noise (lock files, editor swap files, *.pyc) lands here.
-        try:
-            suffix = Path(event.src_path).suffix.lower()
-        except Exception:
-            return
-        if suffix not in _WATCHABLE_EXTENSIONS:
-            return
-
+        # Editors save-via-rename: a temp filename (``foo.swp.tmp``) gets
+        # renamed to the real filename (``foo.py``). The src_path is the
+        # temp; the real change is on dest_path. For moves, allow either
+        # side to satisfy the extension allowlist.
+        if not _has_watchable_extension(event.src_path):
+            if not (also_check_dest and _has_watchable_extension(getattr(event, "dest_path", ""))):
+                return
         with self._lock:
             if self._timer is not None:
                 self._timer.cancel()
             self._timer = threading.Timer(_DEBOUNCE_SECONDS, self._fire)
             self._timer.daemon = True
             self._timer.start()
+
+    # Specific event subscriptions — opened/closed are deliberately omitted.
+    def on_created(self, event: FileSystemEvent) -> None:
+        self._maybe_schedule(event)
+
+    def on_modified(self, event: FileSystemEvent) -> None:
+        self._maybe_schedule(event)
+
+    def on_moved(self, event: FileSystemEvent) -> None:
+        self._maybe_schedule(event, also_check_dest=True)
+
+    def on_deleted(self, event: FileSystemEvent) -> None:
+        self._maybe_schedule(event)
+
+    def cancel_pending(self) -> None:
+        """Cancel any armed debounce timer.
+
+        Called by WatcherService.stop() before observer teardown so an
+        event right before shutdown doesn't fire _mine_fn after the
+        daemon has begun teardown. Closes Copilot finding on
+        jphein/palace-daemon#2.
+        """
+        with self._lock:
+            if self._timer is not None:
+                self._timer.cancel()
+                self._timer = None
 
     def _fire(self) -> None:
         try:
@@ -190,12 +237,15 @@ class WatcherService:
 
     Start in the FastAPI lifespan; stop in the lifespan teardown. Each
     WatchTarget gets a recursive watch and its own debounced handler.
+    A failure scheduling one target (inotify watch limit, transient
+    permission error) does NOT abort the others.
     """
 
     def __init__(self, mine_fn: Callable[[str, str], None]):
         self._mine_fn = mine_fn
         self._observer = None
         self._targets: list[WatchTarget] = []
+        self._handlers: list[_DebouncedMineHandler] = []
 
     def start(self, targets: list[WatchTarget]) -> None:
         if Observer is None:
@@ -208,18 +258,49 @@ class WatcherService:
             _log.info("PALACE_WATCH_DIRS empty — file-watcher idle.")
             return
 
-        self._targets = targets
-        self._observer = Observer()
+        observer = Observer()
+        scheduled: list[WatchTarget] = []
+        handlers: list[_DebouncedMineHandler] = []
         for target in targets:
             handler = _DebouncedMineHandler(target, self._mine_fn)
-            self._observer.schedule(handler, str(target.path), recursive=True)
+            try:
+                observer.schedule(handler, str(target.path), recursive=True)
+            except Exception as e:
+                # One unwatchable tree (e.g. inotify watch limit on a
+                # large repo) shouldn't disable every other target.
+                # Closes Copilot finding on jphein/palace-daemon#2.
+                _log.warning("watcher: failed to schedule %s — %s", target.path, e)
+                continue
+            scheduled.append(target)
+            handlers.append(handler)
             _log.info("watching %s → wing=%s", target.path, target.wing)
-        self._observer.start()
-        _log.info("WatcherService started with %d target(s)", len(targets))
+
+        if not scheduled:
+            _log.warning("WatcherService: no targets scheduled successfully — staying idle.")
+            return
+
+        try:
+            observer.start()
+        except Exception:
+            _log.exception("WatcherService observer.start() failed — staying idle.")
+            return
+
+        self._observer = observer
+        self._targets = scheduled
+        self._handlers = handlers
+        _log.info("WatcherService started with %d target(s)", len(scheduled))
 
     def stop(self) -> None:
         if self._observer is None:
             return
+        # Cancel armed debounce timers before tearing down the observer
+        # so a file event right before shutdown doesn't fire _mine_fn
+        # mid-teardown (Copilot finding on jphein/palace-daemon#2).
+        for handler in self._handlers:
+            try:
+                handler.cancel_pending()
+            except Exception:
+                _log.exception("watcher: cancel_pending failed for %s", handler._target.path)
         try:
             self._observer.stop()
             self._observer.join(timeout=5.0)
@@ -227,9 +308,32 @@ class WatcherService:
             _log.exception("WatcherService stop failed")
         finally:
             self._observer = None
+            self._handlers = []
+
+    @property
+    def is_running(self) -> bool:
+        """True only when at least one target is actively being observed."""
+        return self._observer is not None and bool(self._targets)
 
     def list_targets(self) -> list[dict[str, str]]:
         return [{"path": str(t.path), "wing": t.wing} for t in self._targets]
+
+
+def _log_future_exception(future: "asyncio.Future") -> None:
+    """Surface exceptions raised inside the scheduled mine coroutine.
+
+    `run_coroutine_threadsafe` returns a Future the caller must observe;
+    if the coroutine raises and the Future is dropped, the exception is
+    swallowed silently. Attaching this callback ensures watcher-driven
+    mine failures show up in the daemon log instead of disappearing.
+    Closes Copilot finding on jphein/palace-daemon#2.
+    """
+    try:
+        exc = future.exception()
+    except (asyncio.CancelledError, asyncio.InvalidStateError):
+        return
+    if exc is not None:
+        _log.error("watcher-scheduled mine raised: %r", exc, exc_info=exc)
 
 
 def make_async_mine_fn(loop: asyncio.AbstractEventLoop, internal_mine: Callable):
@@ -237,14 +341,17 @@ def make_async_mine_fn(loop: asyncio.AbstractEventLoop, internal_mine: Callable)
 
     The watchdog handler runs on a background thread, but the daemon's
     /mine subprocess + semaphore is async. Bridge by scheduling the
-    coroutine onto the daemon's event loop via run_coroutine_threadsafe.
+    coroutine onto the daemon's event loop via run_coroutine_threadsafe,
+    and observe the returned Future so coroutine errors land in the log.
     """
 
     def _trigger(path: str, wing: str) -> None:
         _log.info("watcher fired mine: dir=%s wing=%s", path, wing)
         try:
-            asyncio.run_coroutine_threadsafe(internal_mine(path, wing), loop)
+            future = asyncio.run_coroutine_threadsafe(internal_mine(path, wing), loop)
         except Exception:
             _log.exception("scheduling internal_mine failed")
+            return
+        future.add_done_callback(_log_future_exception)
 
     return _trigger
