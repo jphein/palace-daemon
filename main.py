@@ -385,17 +385,58 @@ async def _drain_pending_mines() -> int:
                 failed_lines.append(line)
         # Replay in original order
         unique_entries.reverse()
+        # Same valid-mode/extract sets as the live /mine endpoint —
+        # apply them on replay too so a queue entry can't smuggle through
+        # a value the live endpoint would reject (Copilot finding on
+        # jphein/palace-daemon#4).
+        VALID_MODES = {"convos", "projects"}
+        VALID_EXTRACTS = {"exchange", "general"}
         for line, entry in unique_entries:
             try:
                 payload = entry["payload"]
-                directory = _translate_client_path(payload["dir"])
-                if not Path(directory).is_dir():
+                raw_dir = payload.get("dir")
+                if not isinstance(raw_dir, str) or not raw_dir:
+                    _log.warning("drain-mine: skipping entry — invalid 'dir'")
+                    continue
+                directory = _translate_client_path(raw_dir)
+                dir_path = Path(directory)
+                # Same path-shape gate as /mine (absolute + no traversal).
+                if not dir_path.is_absolute() or ".." in dir_path.parts:
+                    _log.warning(
+                        "drain-mine: skipping %s — non-absolute or contains '..'", raw_dir
+                    )
+                    continue
+                if not dir_path.is_dir():
                     _log.warning("drain-mine: skipping %s — not a directory", directory)
                     continue
                 wing = payload.get("wing", "general")
                 mode = payload.get("mode", "convos")
+                if mode not in VALID_MODES:
+                    _log.warning("drain-mine: skipping %s — invalid mode %r", directory, mode)
+                    continue
+                extract = payload.get("extract")
+                if extract is not None and extract not in VALID_EXTRACTS:
+                    _log.warning(
+                        "drain-mine: skipping %s — invalid extract %r", directory, extract
+                    )
+                    continue
+                limit = payload.get("limit")
+                if limit is not None:
+                    try:
+                        limit = int(limit)
+                    except (TypeError, ValueError):
+                        _log.warning(
+                            "drain-mine: skipping %s — invalid limit %r", directory, limit
+                        )
+                        continue
                 mempalace_bin = os.path.join(os.path.dirname(sys.executable), "mempalace")
                 cmd = [mempalace_bin, "mine", directory, "--mode", mode, "--wing", wing]
+                # Re-apply optional fields the original /mine accepted but
+                # the prior drain dropped silently (Copilot finding on #4).
+                if extract:
+                    cmd += ["--extract", extract]
+                if limit:
+                    cmd += ["--limit", str(limit)]
                 async with _mine_sem:
                     proc = await asyncio.create_subprocess_exec(
                         *cmd,
@@ -406,7 +447,12 @@ async def _drain_pending_mines() -> int:
                 if proc.returncode == 0:
                     count += 1
                 else:
-                    _log.warning("drain-mine: replay returned %s for %s", proc.returncode, directory)
+                    _log.warning(
+                        "drain-mine: replay returned %s for %s\n  stderr: %s",
+                        proc.returncode,
+                        directory,
+                        (stderr or b"").decode(errors="replace")[:300],
+                    )
                     failed_lines.append(line)
             except Exception:
                 _log.exception("drain-mine: entry replay raised")
@@ -659,7 +705,17 @@ async def lifespan(app: FastAPI):
                 )
                 stdout, stderr = await proc.communicate()
             if proc.returncode != 0:
-                logger.warning("watcher mine returned %s for %s", proc.returncode, path)
+                # Surface the actual subprocess output — the rc alone hides
+                # 'No mempalace.yaml found' / 'directory not readable' /
+                # python tracebacks that operators need to diagnose.
+                # Closes Copilot finding on jphein/palace-daemon#3.
+                logger.warning(
+                    "watcher mine returned %s for %s\n  stderr: %s\n  stdout: %s",
+                    proc.returncode,
+                    path,
+                    (stderr or b"").decode(errors="replace")[:500],
+                    (stdout or b"").decode(errors="replace")[-500:],
+                )
 
         watcher = WatcherService(make_async_mine_fn(loop, _internal_mine))
         watcher.start(targets)
@@ -1325,7 +1381,12 @@ async def watch_list(x_api_key: str | None = Header(default=None)):
     """
     _check_auth(x_api_key)
     watcher = getattr(app.state, "watcher", None)
-    if watcher is None:
+    # Belt + suspenders: lifespan only publishes app.state.watcher when
+    # is_running, but check it again here so a thread crash that flips
+    # is_running to False between startup and now is reflected in the
+    # endpoint's running= field. Closes Copilot finding on
+    # jphein/palace-daemon#3.
+    if watcher is None or not getattr(watcher, "is_running", False):
         return {"running": False, "targets": []}
     return {"running": True, "targets": watcher.list_targets()}
 
