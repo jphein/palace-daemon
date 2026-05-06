@@ -320,6 +320,108 @@ async def _enqueue_pending_write(payload: dict) -> None:
     await asyncio.to_thread(_append)
 
 
+def _pending_mines_path() -> str:
+    """Location of the jsonl queue that holds /mine requests during rebuild.
+
+    Separate from the silent-save queue because mines are fire-and-forget
+    subprocess invocations rather than diary writes — replayed via the
+    same /mine subprocess pattern, not _do_silent_save_write.
+    """
+    palace_path = _mp._config.palace_path
+    parent = os.path.dirname(palace_path.rstrip("/")) or os.path.expanduser("~")
+    return os.path.join(parent, "palace-daemon-pending-mines.jsonl")
+
+
+async def _enqueue_pending_mine(payload: dict) -> None:
+    """Append a /mine request payload to the pending-mines queue (off-loop)."""
+    path = _pending_mines_path()
+    line = json.dumps({"payload": payload, "enqueued_at": datetime.now().isoformat()})
+
+    def _append():
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+
+    await asyncio.to_thread(_append)
+
+
+async def _drain_pending_mines() -> int:
+    """Replay queued /mine requests after a rebuild completes.
+
+    Same rename-then-read pattern as _drain_pending_writes — concurrent
+    /mine POSTs landing during the drain go to a fresh pending file.
+    Each entry is replayed by spawning the same subprocess the live
+    /mine endpoint would, gated by _mine_sem. Failed entries are
+    quarantined to a timestamped .failed-* file.
+    """
+    path = _pending_mines_path()
+    if not os.path.isfile(path):
+        return 0
+    proc_path = path + ".processing"
+    try:
+        os.rename(path, proc_path)
+    except OSError:
+        return 0
+    count = 0
+    failed_lines: list[str] = []
+    try:
+        with open(proc_path, encoding="utf-8") as f:
+            lines = [ln for ln in f.readlines() if ln.strip()]
+        # Dedup queued mines by (dir, wing, mode) — re-mining the same dir
+        # is the goal, not running it N times. A storm of hook fires during
+        # rebuild may have queued the same target dozens of times; one
+        # successful drain replay covers them all.
+        seen: set = set()
+        unique_entries: list = []
+        for line in reversed(lines):  # keep newest of each (dir, wing, mode)
+            try:
+                entry = json.loads(line)
+                payload = entry.get("payload", {})
+                key = (payload.get("dir"), payload.get("wing"), payload.get("mode", "convos"))
+                if key in seen:
+                    continue
+                seen.add(key)
+                unique_entries.append((line, entry))
+            except json.JSONDecodeError:
+                failed_lines.append(line)
+        # Replay in original order
+        unique_entries.reverse()
+        for line, entry in unique_entries:
+            try:
+                payload = entry["payload"]
+                directory = _translate_client_path(payload["dir"])
+                if not Path(directory).is_dir():
+                    _log.warning("drain-mine: skipping %s — not a directory", directory)
+                    continue
+                wing = payload.get("wing", "general")
+                mode = payload.get("mode", "convos")
+                mempalace_bin = os.path.join(os.path.dirname(sys.executable), "mempalace")
+                cmd = [mempalace_bin, "mine", directory, "--mode", mode, "--wing", wing]
+                async with _mine_sem:
+                    proc = await asyncio.create_subprocess_exec(
+                        *cmd,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    stdout, stderr = await proc.communicate()
+                if proc.returncode == 0:
+                    count += 1
+                else:
+                    _log.warning("drain-mine: replay returned %s for %s", proc.returncode, directory)
+                    failed_lines.append(line)
+            except Exception:
+                _log.exception("drain-mine: entry replay raised")
+                failed_lines.append(line)
+        if failed_lines:
+            qpath = proc_path + ".failed-" + datetime.now().strftime("%Y%m%d%H%M%S")
+            with open(qpath, "w", encoding="utf-8") as f:
+                f.writelines(failed_lines)
+            _log.warning("drain-mine: %d entries quarantined at %s", len(failed_lines), qpath)
+        os.remove(proc_path)
+    except Exception:
+        _log.exception("drain-mine: read failed; leaving %s in place", proc_path)
+    return count
+
+
 async def _drain_pending_writes() -> int:
     """Replay queued silent-saves after a rebuild completes.
 
@@ -1164,6 +1266,32 @@ async def mine(request: Request, x_api_key: str | None = Header(default=None)):
         except (TypeError, ValueError):
             raise HTTPException(status_code=400, detail="'limit' must be an integer")
 
+    # During /repair mode=rebuild, queue the mine instead of executing it.
+    # Mirrors the /silent-save queue pattern — the rebuild replaces the
+    # collection mid-flight, so any concurrent mine subprocess would race
+    # the swap. After repair completes, _drain_pending_mines() replays
+    # queued mines through the same code path. Pass-through fields preserve
+    # extract/limit on replay.
+    if (
+        _repair_state["in_progress"]
+        and _repair_state.get("mode") == "rebuild"
+    ):
+        await _enqueue_pending_mine({
+            "dir": body.get("dir"),  # original (untranslated) path so replay translates fresh
+            "wing": wing,
+            "mode": mode,
+            "extract": extract,
+            "limit": limit,
+        })
+        return {
+            "queued": True,
+            "reason": "repair-in-progress",
+            "systemMessage": (
+                "Mine queued — palace is rebuilding. Will replay automatically "
+                "when repair completes."
+            ),
+        }
+
     mempalace_bin = os.path.join(os.path.dirname(sys.executable), "mempalace")
     cmd = [mempalace_bin, "mine", directory, "--mode", mode, "--wing", wing]
     if extract:
@@ -1381,8 +1509,13 @@ async def repair(request: Request, x_api_key: str | None = Header(default=None))
         _repair_state["mode"] = None
         _repair_state["started_at"] = None
 
+    drained_mines = 0
     if mode == "rebuild":
         drained = await _drain_pending_writes()
+        # Also replay any /mine requests queued during the rebuild. Mirrors
+        # _drain_pending_writes — same rename-then-read, dedup-by-target,
+        # subprocess re-execution.
+        drained_mines = await _drain_pending_mines()
 
     duration = (datetime.now() - start).total_seconds()
     _log.info(messages.repair_complete(mode, drained, duration))
@@ -1390,6 +1523,7 @@ async def repair(request: Request, x_api_key: str | None = Header(default=None))
         "mode": mode,
         "result": result,
         "drained": drained,
+        "drained_mines": drained_mines,
         "duration_s": round(duration, 3),
         "systemMessage": messages.repair_complete(mode, drained, duration),
     }
@@ -1397,21 +1531,26 @@ async def repair(request: Request, x_api_key: str | None = Header(default=None))
 
 @app.get("/repair/status")
 async def repair_status():
-    """Current repair state + pending-writes queue depth."""
-    queue_path = _pending_writes_path()
-    pending = 0
-    if os.path.isfile(queue_path):
+    """Current repair state + pending-writes + pending-mines queue depths."""
+    def _count_lines(path: str) -> int:
+        if not os.path.isfile(path):
+            return 0
         try:
-            with open(queue_path, encoding="utf-8") as f:
-                pending = sum(1 for ln in f if ln.strip())
+            with open(path, encoding="utf-8") as f:
+                return sum(1 for ln in f if ln.strip())
         except OSError:
-            pending = -1
+            return -1
+
+    writes_path = _pending_writes_path()
+    mines_path = _pending_mines_path()
     return {
         "in_progress": _repair_state["in_progress"],
         "mode": _repair_state["mode"],
         "started_at": _repair_state["started_at"],
-        "pending_writes": pending,
-        "pending_writes_path": queue_path,
+        "pending_writes": _count_lines(writes_path),
+        "pending_writes_path": writes_path,
+        "pending_mines": _count_lines(mines_path),
+        "pending_mines_path": mines_path,
     }
 
 
