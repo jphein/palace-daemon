@@ -1115,6 +1115,17 @@ async def mcp_proxy(request: Request, x_api_key: str | None = Header(default=Non
             "mempalace_status": _fast_mcp_status_payload,
             "mempalace_kg_stats": _fast_mcp_kg_stats_payload,
         }[tool]
+    elif (
+        PALACE_MCP_FAST_INTERCEPT
+        and tool == "mempalace_list_drawers"
+        and set(arguments) <= {"wing", "room", "limit", "offset"}
+    ):
+        # #231: fast-intercept the unfiltered/wing-scoped listing (the
+        # upstream tool sweeps every drawer before paginating). since/
+        # before/tags arguments are Python-side filters the fast path
+        # doesn't implement — those requests fall through to the tool.
+        list_args = dict(arguments)
+        fast_fn = lambda: _fast_list_payload(**list_args)  # noqa: E731
     if fast_fn is not None:
         loop = asyncio.get_running_loop()
         try:
@@ -1429,6 +1440,21 @@ async def list_drawers(
     """
     _check_auth(x_api_key)
     # wing/room already canonicalized by dependencies (palace-daemon#179).
+    # #231 fast path: the upstream tool fetches EVERY drawer (documents
+    # included) before slicing the page — ~50s at 490K drawers with no
+    # wing filter. The SQL fast path serves the same envelope in ms;
+    # any failure falls back to the slow tool (#49 pattern).
+    if PALACE_MCP_FAST_INTERCEPT:
+        loop = asyncio.get_running_loop()
+        try:
+            return await loop.run_in_executor(
+                None,
+                lambda: _fast_list_payload(
+                    wing=wing, room=room, limit=int(limit), offset=int(offset)
+                ),
+            )
+        except Exception as e:
+            _log.warning("/list fast path failed → falling back to MCP tool: %s", e)
     args: dict = {"limit": int(limit), "offset": int(offset)}
     if wing is not None:
         args["wing"] = wing
@@ -1688,6 +1714,7 @@ async def status_fast(x_api_key: str | None = Header(default=None)):
 # via lazy `import main`, which preserves `patch.object(main, ...)` in the
 # unit tests (test_mcp_fast_intercept.py) without test edits.
 from fast_intercept import (  # noqa: E402
+    fast_list_payload as _fast_list_payload,
     fast_mcp_kg_stats_payload as _fast_mcp_kg_stats_payload,
     fast_mcp_status_payload as _fast_mcp_status_payload,
 )
