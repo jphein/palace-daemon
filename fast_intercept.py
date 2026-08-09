@@ -139,3 +139,203 @@ def fast_mcp_kg_stats_payload() -> dict:
         "expired_facts": 0,
         "relationship_types": list(stats.get("relationship_types", [])),
     }
+
+
+# ── /list fast path (#231) ───────────────────────────────────────────────────
+#
+# ``mempalace_list_drawers`` fetches EVERY row (documents included) into
+# Python, collapses chunk groups, then slices the page — ~50s for limit=5
+# at 490K drawers when no wing filter narrows the fetch. The fast path
+# pages in SQL over "anchor" rows (``metadata->>'parent_drawer_id' IS
+# NULL`` — singles and legacy logical parents), which covers all but the
+# few chunk groups written without a legacy parent row (49 groups / 146
+# chunk rows at production size). Those orphan groups are listed AFTER
+# the anchors in a stable order — the upstream tool's ordering contract
+# is only "approximates insertion order, not guaranteed", so a stable
+# alternative order is compliant.
+#
+# Chunk-group side data (parents, chunk ids, first-chunk preview) is tiny
+# and changes rarely, so it is swept once per ``_CHUNK_GROUP_TTL`` and
+# cached; the page query itself is ~2ms unfiltered / ~140ms wing-filtered.
+
+_CHUNK_GROUP_TTL = 300.0
+_chunk_group_cache: dict = {"at": 0.0, "groups": None}
+
+_LIST_MAX_RESULTS = 100  # mirrors mempalace mcp_server._MAX_RESULTS
+
+
+def _tags_from_meta(meta: dict) -> list:
+    """Tolerant read of the tags metadata key (list, JSON string, or CSV)."""
+    raw = meta.get("tags") if isinstance(meta, dict) else None
+    if isinstance(raw, list):
+        return [t for t in raw if isinstance(t, str) and t]
+    if isinstance(raw, str) and raw:
+        import json as _json
+
+        try:
+            parsed = _json.loads(raw)
+            if isinstance(parsed, list):
+                return [t for t in parsed if isinstance(t, str) and t]
+        except ValueError:
+            pass
+        return [t.strip() for t in raw.split(",") if t.strip()]
+    return []
+
+
+def _list_entry(drawer_id, document, wing, room, meta) -> dict:
+    """One logical-drawer envelope entry, matching the slow tool's shape."""
+    from pathlib import Path
+
+    meta = dict(meta or {})
+    meta["wing"] = wing or ""
+    meta["room"] = room or ""
+    if meta.get("source_file"):
+        meta["source_file"] = Path(str(meta["source_file"])).name
+    doc = document or ""
+    preview = doc[:200] + "..." if len(doc) > 200 else doc
+    return {
+        "drawer_id": drawer_id,
+        "wing": wing or "",
+        "room": room or "",
+        "content_preview": preview,
+        "metadata": meta,
+        "tags": _tags_from_meta(meta),
+    }
+
+
+def _load_chunk_groups(cur) -> dict:
+    """Sweep the chunk side: parent -> group info. Cheap (146 rows today)."""
+    cur.execute(
+        "SELECT metadata->>'parent_drawer_id' AS parent, id, document, wing, room, metadata "
+        "FROM mempalace_drawers WHERE metadata->>'parent_drawer_id' IS NOT NULL "
+        "ORDER BY 1, NULLIF(metadata->>'chunk_index', '')::int NULLS LAST, id"
+    )
+    groups: dict = {}
+    for parent, cid, doc, wing, room, meta in cur.fetchall():
+        g = groups.setdefault(
+            parent,
+            {"chunk_ids": [], "wing": wing, "room": room, "document": doc, "metadata": meta},
+        )
+        g["chunk_ids"].append(cid)
+    if groups:
+        cur.execute(
+            "SELECT id FROM mempalace_drawers WHERE id = ANY(%s)", (list(groups),)
+        )
+        legacy = {r[0] for r in cur.fetchall()}
+        for parent, g in groups.items():
+            g["has_legacy_row"] = parent in legacy
+    return groups
+
+
+def _chunk_groups_cached(cur) -> dict:
+    import time as _t
+
+    if (
+        _chunk_group_cache["groups"] is None
+        or _t.monotonic() - _chunk_group_cache["at"] >= _CHUNK_GROUP_TTL
+    ):
+        _chunk_group_cache["groups"] = _load_chunk_groups(cur)
+        _chunk_group_cache["at"] = _t.monotonic()
+    return _chunk_group_cache["groups"]
+
+
+def fast_list_payload(wing=None, room=None, limit=20, offset=0) -> dict:
+    """``mempalace_list_drawers`` envelope via direct SQL (#231).
+
+    Serves the wing/room/limit/offset argument subset only — ``since`` /
+    ``before`` / ``tags`` filters must fall through to the slow tool.
+    Raises on any DB problem; callers fall back to the slow path (#49
+    pattern), recording the error for /health observability (#108).
+    """
+    from postgres import postgres_dsn
+    from db_errors import record_db_error
+
+    dsn = postgres_dsn()
+    if not dsn:
+        raise RuntimeError("postgres backend not configured")
+
+    limit = max(1, min(int(limit), _LIST_MAX_RESULTS))
+    offset = max(0, int(offset))
+
+    import psycopg2
+
+    try:
+        conn = psycopg2.connect(dsn, connect_timeout=3)
+    except psycopg2.OperationalError as e:
+        record_db_error(e)
+        raise
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                # NOTE: where_sql below is assembled ONLY from the fixed
+                # literals in this function; user values always bind via
+                # placeholders. (Static-analysis S608 hits are false
+                # positives on the composed fragment.)
+                cur.execute("SET LOCAL statement_timeout = '10s'")
+                where = ["metadata->>'parent_drawer_id' IS NULL"]
+                params: list = []
+                if wing:
+                    where.append("wing = %s")
+                    params.append(wing)
+                if room:
+                    where.append("room = %s")
+                    params.append(room)
+                where_sql = " AND ".join(where)
+
+                cur.execute(
+                    f"SELECT count(*) FROM mempalace_drawers WHERE {where_sql}", params
+                )
+                anchor_total = cur.fetchone()[0]
+
+                groups = _chunk_groups_cached(cur)
+                orphans = [
+                    (parent, g)
+                    for parent, g in sorted(groups.items())
+                    if not g.get("has_legacy_row")
+                    and (not wing or g.get("wing") == wing)
+                    and (not room or g.get("room") == room)
+                ]
+                total = anchor_total + len(orphans)
+
+                page: list = []
+                if offset < anchor_total:
+                    cur.execute(
+                        f"SELECT id, document, wing, room, metadata FROM mempalace_drawers "
+                        f"WHERE {where_sql} ORDER BY id LIMIT %s OFFSET %s",
+                        [*params, limit, offset],
+                    )
+                    for did, doc, w, r, meta in cur.fetchall():
+                        entry = _list_entry(did, doc, w, r, meta)
+                        g = groups.get(did)
+                        if g:  # legacy logical row for a chunk group
+                            entry["metadata"]["chunks"] = len(g["chunk_ids"])
+                            entry["metadata"]["chunk_ids"] = list(g["chunk_ids"])
+                        page.append(entry)
+
+                # Orphan chunk groups occupy positions [anchor_total, total).
+                if len(page) < limit:
+                    o_start = max(0, offset - anchor_total)
+                    o_take = limit - len(page)
+                    for parent, g in orphans[o_start : o_start + o_take]:
+                        entry = _list_entry(
+                            parent, g.get("document"), g.get("wing"), g.get("room"), g.get("metadata")
+                        )
+                        entry["metadata"]["chunks"] = len(g["chunk_ids"])
+                        entry["metadata"]["chunk_ids"] = list(g["chunk_ids"])
+                        page.append(entry)
+    except psycopg2.Error as e:
+        # #108: query-time failures (statement timeout, dropped connection,
+        # bad cast in the chunk sweep) must reach /health.db_errors too —
+        # not just connect() errors — before the caller falls back.
+        record_db_error(e)
+        raise
+    finally:
+        conn.close()
+
+    return {
+        "drawers": page,
+        "total": total,
+        "count": len(page),
+        "offset": offset,
+        "limit": limit,
+    }
