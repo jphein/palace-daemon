@@ -267,6 +267,10 @@ def fast_list_payload(wing=None, room=None, limit=20, offset=0) -> dict:
     try:
         with conn:
             with conn.cursor() as cur:
+                # NOTE: where_sql below is assembled ONLY from the fixed
+                # literals in this function; user values always bind via
+                # placeholders. (Static-analysis S608 hits are false
+                # positives on the composed fragment.)
                 cur.execute("SET LOCAL statement_timeout = '10s'")
                 where = ["metadata->>'parent_drawer_id' IS NULL"]
                 params: list = []
@@ -319,6 +323,12 @@ def fast_list_payload(wing=None, room=None, limit=20, offset=0) -> dict:
                         entry["metadata"]["chunks"] = len(g["chunk_ids"])
                         entry["metadata"]["chunk_ids"] = list(g["chunk_ids"])
                         page.append(entry)
+    except psycopg2.Error as e:
+        # #108: query-time failures (statement timeout, dropped connection,
+        # bad cast in the chunk sweep) must reach /health.db_errors too —
+        # not just connect() errors — before the caller falls back.
+        record_db_error(e)
+        raise
     finally:
         conn.close()
 
