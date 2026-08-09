@@ -110,6 +110,39 @@ class TestIngestOutcomeOut(unittest.TestCase):
         self.assertFalse(ok)
         self.assertEqual(outcome["status"], "failed")
 
+    def test_retry_failure_reclassifies_outcome(self):
+        """A wake-eligible failure + timed-out retry reports the RETRY's outcome.
+
+        CodeRabbit catch on PR #228: the retry ran without failure_out, so
+        outcome_out classified the original connection error instead of the
+        final timeout.
+        """
+        calls = {"n": 0}
+
+        def fake_ingest(daemon_url, tp, wing, failure_out=None):
+            calls["n"] += 1
+            if failure_out is not None:
+                if calls["n"] == 1:
+                    failure_out["error"] = "Connection refused"
+                    failure_out["eligible"] = True
+                else:
+                    failure_out["error"] = "network/transport: timed out"
+                    failure_out["eligible"] = False
+            return False
+
+        with patch.object(hook, "_ingest_transcript_via_daemon", fake_ingest), \
+             patch.object(hook, "_load_auto_wake", return_value={"command": "wake"}), \
+             patch.object(hook, "_attempt_wake", return_value=True), \
+             patch.object(hook, "_journal_failed_ingest"):
+            outcome = {}
+            ok = hook._ingest_with_wake_and_journal(
+                "http://d:8085", "/tmp/t.jsonl", "w", "s", outcome_out=outcome)
+        self.assertFalse(ok)
+        self.assertEqual(calls["n"], 2, "wake success must trigger exactly one retry")
+        self.assertEqual(outcome["status"], "timeout",
+                         "outcome must classify the final attempt, not the first")
+        self.assertIn("timed out", outcome["detail"])
+
     def test_bool_only_contract_still_works(self):
         # Existing callers pass no outcome_out; the bool contract holds.
         with patch.object(hook, "_ingest_transcript_via_daemon", return_value=True):

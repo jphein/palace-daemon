@@ -1431,8 +1431,11 @@ def _ingest_transcript_via_daemon(daemon_url: str, transcript_path: str, wing: s
                    timeout=settings.get("mine_timeout_s", 60),
                    mode="session", wing=wing,
                    label="session-manifest mine (best-effort)")
-    except Exception:
-        pass  # best-effort; convos mine is the primary
+    except Exception as e:
+        # best-effort; convos mine is the primary. _post_mine logs its own
+        # transport failures — this catches everything else, and stays
+        # visible rather than vanishing (#382 was born from silent paths).
+        _log(f"session-manifest mine (best-effort) raised (non-fatal): {e}")
 
     return ok
 
@@ -1487,7 +1490,13 @@ def _ingest_with_wake_and_journal(daemon_url: str, transcript_path: str, wing: s
         if wake_settings:
             if _attempt_wake(daemon_url, wake_settings):
                 _log("auto_wake: retrying transcript ingest after wake")
-                ok = _ingest_transcript_via_daemon(daemon_url, transcript_path, wing)
+                # Reset and re-capture: the outcome must classify the FINAL
+                # attempt, not the original wake-eligible failure (a retry
+                # that times out must report "timeout", not the initial
+                # connection error).
+                failure.clear()
+                ok = _ingest_transcript_via_daemon(daemon_url, transcript_path, wing,
+                                                   failure_out=failure)
                 if ok:
                     if outcome_out is not None:
                         outcome_out["status"] = "ok"
