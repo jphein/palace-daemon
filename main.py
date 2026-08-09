@@ -1268,6 +1268,93 @@ async def health():
     return payload
 
 
+# ── /health/ready — search-path readiness (mempalace#384) ────────────────────
+#
+# /health deliberately avoids the query path: it must answer instantly and
+# under load, so it only opens the collection. That design made the
+# 2026-07..08 searcher outage (UnboundLocalError in every hybrid search)
+# invisible to monitoring — /health stayed green for a month while every
+# mempalace_search call 500'd. /health/ready closes that gap: it runs the
+# real mempalace_search MCP tool (the exact code path that broke) and turns
+# the outcome into a keyless, content-free ready/failing signal.
+#
+# Keyless by the same argument as /health: external monitors shouldn't need
+# a palace API key to know the service is broken. Because it is keyless, the
+# response NEVER carries search results or error message text (messages can
+# embed tracebacks); failures expose only the JSON-RPC error code. The full
+# error is logged server-side for operators.
+#
+# Poll-safe: the probe result is cached for PALACE_READY_TTL_SECONDS
+# (default 30) behind a single-flight lock, so aggressive polling costs one
+# limit-1 search per TTL window, not one per request.
+
+PALACE_READY_TTL_SECONDS = float(os.getenv("PALACE_READY_TTL_SECONDS", "30"))
+_READY_PROBE_QUERY = "palace readiness probe"
+_ready_cache: dict = {"at": 0.0, "ok": None, "error_code": None, "latency_ms": None}
+_ready_lock = asyncio.Lock()
+
+
+async def _run_ready_probe() -> dict:
+    """Run one limit-1 mempalace_search through _call and summarize it.
+
+    Returns the new cache entry. Never raises: any exception is folded
+    into ok=False with the class name logged (not exposed).
+    """
+    started = _time.monotonic()
+    try:
+        result = await _call({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "mempalace_search",
+                "arguments": _search_args(_READY_PROBE_QUERY, 1),
+            },
+        })
+        error = result.get("error") if isinstance(result, dict) else None
+        ok = error is None
+        error_code = error.get("code") if isinstance(error, dict) else None
+        if not ok:
+            _log.warning(
+                "/health/ready: search probe FAILING (code=%s): %s",
+                error_code,
+                (error or {}).get("message", ""),
+            )
+    except Exception as e:
+        ok = False
+        error_code = -32000
+        _log.warning("/health/ready: search probe raised %s: %s", type(e).__name__, e)
+    return {
+        "at": _time.time(),
+        "ok": ok,
+        "error_code": error_code if not ok else None,
+        "latency_ms": int((_time.monotonic() - started) * 1000),
+    }
+
+
+@app.get("/health/ready")
+async def health_ready():
+    global _ready_cache
+    cached = True
+    if _time.time() - _ready_cache["at"] >= PALACE_READY_TTL_SECONDS:
+        async with _ready_lock:
+            # Re-check under the lock: a concurrent request may have just
+            # refreshed the cache while this one waited.
+            if _time.time() - _ready_cache["at"] >= PALACE_READY_TTL_SECONDS:
+                _ready_cache = await _run_ready_probe()
+                cached = False
+    payload = {
+        "status": "ready" if _ready_cache["ok"] else "failing",
+        "probe": "mempalace_search",
+        "latency_ms": _ready_cache["latency_ms"],
+        "cached": cached,
+        "ttl_seconds": PALACE_READY_TTL_SECONDS,
+    }
+    if not _ready_cache["ok"]:
+        payload["error_code"] = _ready_cache["error_code"]
+        return JSONResponse(content=payload, status_code=503)
+    return payload
+
+
 def _search_args(query: str, limit: int) -> dict:
     """Build the mempalace_search MCP tool arguments dict.
 
