@@ -125,6 +125,7 @@ if ! rsync -az --delete \
     --exclude='.venv/' \
     --exclude='venv/' \
     --exclude='.pytest_cache/' \
+    --exclude='.claude/' \
     --exclude='*.egg-info/' \
     --exclude='.coverage' \
     "$LOCAL_DIR/" "$SSH_TARGET:$REMOTE_DIR/"; then
