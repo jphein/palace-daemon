@@ -886,7 +886,7 @@ def _post_mcp(daemon_url: str, tool_name: str, params: dict):
 
 
 def _post_mine(daemon_url: str, mine_dir: str, timeout: int = 60,
-               mode: str = "convos", wing: str = ""):
+               mode: str = "convos", wing: str = "", label: str = "mine"):
     """POST /mine to daemon. Returns (ok, response_or_failure_reason).
 
     Mode defaults to ``convos`` (the only sensible default for transcript
@@ -894,6 +894,10 @@ def _post_mine(daemon_url: str, mine_dir: str, timeout: int = 60,
     the older ``"auto"`` literal was never valid and silently 400'd).
     Wing is forwarded when truthy so transcript drawers land in the right
     project wing rather than the daemon's default ``"general"``.
+    Label names the call site in failure logs — the hook fires /mine from
+    several places (primary transcript mine, best-effort session manifest,
+    precompact MEMPAL_DIR mine) and an unlabeled failure line next to an
+    unrelated summary reads as a contradiction (#382).
     """
     body = {"dir": mine_dir, "mode": mode}
     if wing:
@@ -915,10 +919,10 @@ def _post_mine(daemon_url: str, mine_dir: str, timeout: int = 60,
                 body = None
             return True, body
     except urllib.error.HTTPError as e:
-        _log(f"mine via daemon rejected (HTTP {e.code} {e.reason}) — check PALACE_API_KEY")
+        _log(f"{label} via daemon rejected (HTTP {e.code} {e.reason}) — check PALACE_API_KEY")
         return False, {"error": f"HTTP {e.code} {e.reason}"}
     except Exception as e:
-        _log(f"mine via daemon failed (network/transport): {e}")
+        _log(f"{label} via daemon failed (network/transport): {e}")
         return False, {"error": f"network/transport: {e}"}
 
 
@@ -1394,7 +1398,8 @@ def _ingest_transcript_via_daemon(daemon_url: str, transcript_path: str, wing: s
     try:
         ok, response = _post_mine(daemon_url, mine_dir,
                                   timeout=settings.get("mine_timeout_s", 60),
-                                  mode="convos", wing=wing)
+                                  mode="convos", wing=wing,
+                                  label="transcript mine")
         if ok:
             warning = (response or {}).get("warning", "")
             if warning:
@@ -1424,15 +1429,32 @@ def _ingest_transcript_via_daemon(daemon_url: str, transcript_path: str, wing: s
     try:
         _post_mine(daemon_url, mine_dir,
                    timeout=settings.get("mine_timeout_s", 60),
-                   mode="session", wing=wing)
-    except Exception:
-        pass  # best-effort; convos mine is the primary
+                   mode="session", wing=wing,
+                   label="session-manifest mine (best-effort)")
+    except Exception as e:
+        # best-effort; convos mine is the primary. _post_mine logs its own
+        # transport failures — this catches everything else, and stays
+        # visible rather than vanishing (#382 was born from silent paths).
+        _log(f"session-manifest mine (best-effort) raised (non-fatal): {e}")
 
     return ok
 
 
+def _is_timeout_error(err) -> bool:
+    """True when a /mine failure reads as a client-side timeout.
+
+    A timed-out /mine is ambiguous: the daemon may still be processing and
+    land the ingest after the hook gave up (observed 2026-08-02: /mine on a
+    long transcript returned 200 OK ~2.5 min after the client's 60 s timeout
+    fired). Callers use this to report "timed out, may still complete
+    server-side" instead of a flat failure (#382).
+    """
+    text = str(err).lower()
+    return "timed out" in text or "timeout" in text
+
+
 def _ingest_with_wake_and_journal(daemon_url: str, transcript_path: str, wing: str,
-                                  session_id: str) -> bool:
+                                  session_id: str, outcome_out=None) -> bool:
     """Ingest a transcript, waking a sleeping host and replaying on failure.
 
     Runs ONLY inside the detached child (after the parent has emitted its
@@ -1450,11 +1472,17 @@ def _ingest_with_wake_and_journal(daemon_url: str, transcript_path: str, wing: s
          next session start.
 
     Returns the final ingest result (True only when the daemon accepted it).
+    Pass ``outcome_out`` (a dict) to also receive how it ended:
+    ``status`` of ``"ok"`` / ``"timeout"`` / ``"failed"``, plus ``detail``
+    (the failure string) on the non-ok statuses — so the caller's summary
+    line can tell the truth instead of collapsing everything to a bool.
     """
     failure = {}
     ok = _ingest_transcript_via_daemon(daemon_url, transcript_path, wing,
                                        failure_out=failure)
     if ok:
+        if outcome_out is not None:
+            outcome_out["status"] = "ok"
         return True
 
     if failure.get("eligible"):
@@ -1462,8 +1490,16 @@ def _ingest_with_wake_and_journal(daemon_url: str, transcript_path: str, wing: s
         if wake_settings:
             if _attempt_wake(daemon_url, wake_settings):
                 _log("auto_wake: retrying transcript ingest after wake")
-                ok = _ingest_transcript_via_daemon(daemon_url, transcript_path, wing)
+                # Reset and re-capture: the outcome must classify the FINAL
+                # attempt, not the original wake-eligible failure (a retry
+                # that times out must report "timeout", not the initial
+                # connection error).
+                failure.clear()
+                ok = _ingest_transcript_via_daemon(daemon_url, transcript_path, wing,
+                                                   failure_out=failure)
                 if ok:
+                    if outcome_out is not None:
+                        outcome_out["status"] = "ok"
                     return True
         else:
             _log("auto_wake: connection-level failure but auto_wake not configured")
@@ -1471,6 +1507,10 @@ def _ingest_with_wake_and_journal(daemon_url: str, transcript_path: str, wing: s
     # Still failed after the wake+retry attempt (or it was never eligible /
     # never configured). Journal for replay on next session start.
     _journal_failed_ingest(transcript_path, wing, session_id)
+    if outcome_out is not None:
+        err = failure.get("error", "unknown")
+        outcome_out["status"] = "timeout" if _is_timeout_error(err) else "failed"
+        outcome_out["detail"] = err
     return False
 
 
@@ -1914,8 +1954,10 @@ def hook_stop(data: dict, harness: str):
         # is journaled for replay on the next session start. All of this
         # latency is invisible — the parent already emitted the optimistic
         # "memories woven" systemMessage above.
-        ok = _ingest_with_wake_and_journal(daemon_url, transcript_path, wing, session_id)
-        _log(f"Silent save (diary+mine) {'OK' if ok else 'FAILED (journaled for replay)'} at exchange {exchange_count} → {wing}")
+        mine_outcome = {}
+        ok = _ingest_with_wake_and_journal(daemon_url, transcript_path, wing,
+                                           session_id, outcome_out=mine_outcome)
+        _log(_compose_save_summary(diary_ok, mine_outcome, exchange_count, wing))
         if not ok:
             failure_themed = _theme_save_fail(exchange_count, trigger, {"error": "mine via daemon failed"})
             _log(f"FAILURE themed (would-have-emitted): {failure_themed}")
@@ -1925,6 +1967,30 @@ def hook_stop(data: dict, harness: str):
         if toast:
             _desktop_notify("MemPalace checkpoint", "Save requested — check Claude")
         _output({"decision": "block", "reason": STOP_BLOCK_REASON})
+
+
+def _compose_save_summary(diary_ok: bool, mine_outcome: dict,
+                          exchange_count: int, wing: str) -> str:
+    """One truthful hook.log summary line for the Stop-hook save.
+
+    The pre-#382 line collapsed both sub-operations into a single
+    ``Silent save (diary+mine) OK`` — which reported OK when only the diary
+    write succeeded (8,218 mine failures logged under a healthy-looking
+    summary). Each sub-operation now reports its own outcome, and a
+    client-side timeout is distinguished from a hard failure because the
+    daemon may still land the ingest after the hook gives up.
+    """
+    diary_part = "diary OK" if diary_ok else "diary FAILED"
+    status = mine_outcome.get("status", "failed")
+    if status == "ok":
+        mine_part = "mine OK"
+    elif status == "timeout":
+        mine_part = (f"mine TIMED OUT ({mine_outcome.get('detail', 'unknown')}; "
+                     "may still complete server-side — journaled for replay)")
+    else:
+        mine_part = (f"mine FAILED ({mine_outcome.get('detail', 'unknown')}; "
+                     "journaled for replay)")
+    return f"Silent save: {diary_part}, {mine_part} at exchange {exchange_count} → {wing}"
 
 
 PRECOMPACT_TOPIC = "precompact"
@@ -1976,7 +2042,9 @@ def hook_precompact(data: dict, harness: str):
     if mine_dir:
         _log(f"Precompact mine via daemon: {mine_dir}")
         ok, mine_response = _post_mine(daemon_url, mine_dir,
-                                       timeout=60, mode="convos", wing=wing)
+                                       timeout=settings.get("mine_timeout_s", 60),
+                                       mode="convos", wing=wing,
+                                       label="MEMPAL_DIR mine")
         _log(f"Precompact MEMPAL_DIR mine {'OK' if ok else 'skipped (daemon unreachable)'}")
         if ok:
             post_palace_count = _format_palace_count(_get_palace_stats(daemon_url))
