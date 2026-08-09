@@ -91,9 +91,13 @@ class TestClass3Negation(unittest.TestCase):
     """Negation/punctuation fragments → stripped + polarity denormalized."""
 
     def test_issue_apostrophe_examples(self):
-        # don't_adapt → not_adapt ; aren't_merged → not_merged
+        # don't_adapt → not_adapt (base `adapt` not a synonym, passes through)
         self.assertEqual(normalize_predicate("don't_adapt"), "not_adapt")
-        self.assertEqual(normalize_predicate("aren't_merged"), "not_merged")
+        # aren't_merged: peel `arent_`, base `merged` canonicalizes to `adds`
+        # (mempalace#45 add-family synonym, landed in mempalace 12be7d2), then
+        # re-prefix → not_adds. Peel-then-canonicalize applied to the expanded
+        # synonym map, not a leaf passthrough.
+        self.assertEqual(normalize_predicate("aren't_merged"), "not_adds")
         self.assertEqual(normalize_predicate("'doesn't_appear'"), "not_appear")
 
     def test_apostrophe_stripped_from_endpoints(self):
@@ -111,9 +115,12 @@ class TestClass3Negation(unittest.TestCase):
         # re-prefix not_. "is not a part of" → base "a_part_of" → part_of
         # → not_part_of.
         self.assertEqual(normalize_predicate("is_not_a_part_of"), "not_part_of")
-        # "isn't a" strips the "isnt_" prefix leaving base "a" (not a known
-        # synonym), so the result is not_a — consistent peel-then-canonicalize.
-        self.assertEqual(normalize_predicate("isnt_a"), "not_a")
+        # "isn't a" strips the "isnt_" prefix leaving base "a", which is a
+        # content-free stopword (mempalace#45 STOPWORD_BLOCKLIST). A negation
+        # of a contentless word carries no relation, so the whole predicate
+        # drops to None — the stopword check applies to the negation-stripped
+        # base too.
+        self.assertIsNone(normalize_predicate("isnt_a"))
 
     def test_bare_negation_token_drops(self):
         self.assertIsNone(normalize_predicate("not_"))
