@@ -3119,8 +3119,26 @@ def _clear_port(port: int):
         pass
 
 
+def _default_peer_writer_env() -> None:
+    """Default MEMPALACE_MCP_ALLOW_PEER_WRITER=1 for server-coordinated backends.
+
+    mempalace v3.7's embedded MCP server takes a process-lifetime palace
+    flock for mutating tools UNLESS this env is set AND the backend is in
+    its multi-process-writer set (postgres qualifies per mempalace#398 —
+    the postgres server coordinates concurrent writers itself). Without
+    it, the daemon's own diary/drawer writes refuse for the entire
+    duration of any `mempalace mine` subprocess the daemon spawns
+    (observed 2026-08-09: every Stop-hook diary checkpoint failed with
+    'Peer MCP writer active' while a long mine ran). setdefault so an
+    operator can still force it off explicitly.
+    """
+    if os.getenv("MEMPALACE_BACKEND", "").strip().lower() == "postgres":
+        os.environ.setdefault("MEMPALACE_MCP_ALLOW_PEER_WRITER", "1")
+
+
 def main():
     global _lock_file
+    _default_peer_writer_env()
     parser = argparse.ArgumentParser(description="palace-daemon — MemPalace HTTP/MCP gateway")
     parser.add_argument("--host", default=DEFAULT_HOST, help="Bind host (default: 0.0.0.0)")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="Bind port (default: 8085)")
