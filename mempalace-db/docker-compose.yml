@@ -28,6 +28,14 @@ services:
       # Bind on 0.0.0.0:5433 to allow palace-daemon (host network) and dev clients
       # on the LAN. mempalace_test on a separate host port for CI fixtures.
       - "5433:5432"
+    # Postgres parallel-query workers allocate dynamic shared memory segments
+    # in /dev/shm; docker's default is 64MB, and AGE graph traversals at the
+    # 2M-triple scale exhaust it ("could not resize shared memory segment ...
+    # DiskFull", 6372 occurrences by 2026-08-20). The failed allocation kills
+    # the session, and the daemon's cached KG connection then fails every
+    # later traversal with "the connection is closed". 1g fits comfortably
+    # inside the 6g cgroup alongside the postgresql.conf working-set tuning.
+    shm_size: 1g
     volumes:
       # Postgres data dir on familiar's local SSD (post-migration from disks 2026-05-24).
       # Do NOT NFS/Samba-mount this — postgres data corruption guaranteed.
