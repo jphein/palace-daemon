@@ -33,9 +33,13 @@ services:
     # 2M-triple scale exhaust it ("could not resize shared memory segment ...
     # DiskFull", 6372 occurrences by 2026-08-20). The failed allocation kills
     # the session, and the daemon's cached KG connection then fails every
-    # later traversal with "the connection is closed". 1g fits comfortably
-    # inside the 6g cgroup alongside the postgresql.conf working-set tuning.
-    shm_size: 1g
+    # later traversal with "the connection is closed". 1g cut the failures
+    # ~99.95% but concurrent depth-3 walks still breached it (2026-08-21:
+    # 3 parallel workers each resizing a DSM segment to 512MB, with
+    # max_parallel_workers_per_gather = 4). 2g absorbs that worst case and
+    # still fits inside the 6g cgroup alongside the postgresql.conf
+    # working-set tuning.
+    shm_size: 2g
     volumes:
       # Postgres data dir on familiar's local SSD (post-migration from disks 2026-05-24).
       # Do NOT NFS/Samba-mount this — postgres data corruption guaranteed.
