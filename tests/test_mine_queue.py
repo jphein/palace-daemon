@@ -212,3 +212,35 @@ class TestEnqueueAndDrain(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestMineablePath:
+    """/mine and the drain path accept a directory OR a single .jsonl transcript.
+
+    Hooks post one transcript per checkpoint (mempalace#414/#426); posting the
+    parent directory re-mined the whole project every time.
+    """
+
+    def test_directory_is_mineable(self, tmp_path):
+        from main import _is_mineable_path
+
+        assert _is_mineable_path(tmp_path) is True
+
+    def test_jsonl_file_is_mineable(self, tmp_path):
+        from main import _is_mineable_path
+
+        f = tmp_path / "session.jsonl"
+        f.write_text("{}\n")
+        assert _is_mineable_path(f) is True
+
+    def test_other_file_is_not_mineable(self, tmp_path):
+        from main import _is_mineable_path
+
+        f = tmp_path / "notes.txt"
+        f.write_text("x")
+        assert _is_mineable_path(f) is False
+
+    def test_missing_path_is_not_mineable(self, tmp_path):
+        from main import _is_mineable_path
+
+        assert _is_mineable_path(tmp_path / "nope.jsonl") is False

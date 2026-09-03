@@ -392,6 +392,20 @@ async def _enqueue_pending_write(payload: dict) -> None:
     await asyncio.to_thread(_append)
 
 
+def _is_mineable_path(path: Path) -> bool:
+    """A mine target is a directory, or a single ``.jsonl`` conversation file.
+
+    Stop/PreCompact hooks used to post a transcript's *parent directory*, so
+    every checkpoint re-mined the whole project (measured 2026-09-03: one
+    such mine ran 6h holding the palace write lock — mempalace#414/#426).
+    ``mempalace mine`` has accepted a single conversation file for a while;
+    accepting it here lets a checkpoint mine only what changed.
+    """
+    if path.is_dir():
+        return True
+    return path.is_file() and path.suffix.lower() == ".jsonl"
+
+
 def _pending_mines_path() -> str:
     """Location of the jsonl queue that holds /mine requests during rebuild.
 
@@ -476,8 +490,10 @@ async def _drain_pending_mines() -> int:
                         "drain-mine: skipping %s — non-absolute or contains '..'", raw_dir
                     )
                     continue
-                if not dir_path.is_dir():
-                    _log.warning("drain-mine: skipping %s — not a directory", directory)
+                if not _is_mineable_path(dir_path):
+                    _log.warning(
+                        "drain-mine: skipping %s — not a directory or .jsonl transcript", directory
+                    )
                     continue
                 wing = payload.get("wing", "general")
                 mode = payload.get("mode", "convos")
@@ -2590,8 +2606,11 @@ async def mine(
         raise HTTPException(status_code=400, detail="'dir' must be an absolute path with no traversal")
     if not dir_path.exists():
         raise HTTPException(status_code=400, detail=f"Directory does not exist: {directory}")
-    if not dir_path.is_dir():
-        raise HTTPException(status_code=400, detail=f"Path is not a directory: {directory}")
+    if not _is_mineable_path(dir_path):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Path is not a directory or a .jsonl transcript: {directory}",
+        )
 
     wing = body.wing
     mode = body.mode
