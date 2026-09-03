@@ -438,6 +438,32 @@ _LOCK_REQUEUE_MAX = 30  # ~ up to 30 * delay of waiting before giving up
 _LOCK_REQUEUE_DELAY_S = 20
 
 
+def _recover_orphaned_processing(path: str, proc_path: str) -> int:
+    """Fold a leftover ``.processing`` batch back into the live queue.
+
+    A daemon restart (or crash) mid-drain leaves the renamed batch behind;
+    the next drain's rename-then-read would then fail forever and every
+    queued hook mine in that batch would be stranded (observed 2026-09-03:
+    a 202-queued transcript sat in ``.processing`` across a restart).
+    Returns the number of lines recovered.
+    """
+    if not os.path.isfile(proc_path):
+        return 0
+    try:
+        with open(proc_path, encoding="utf-8") as f:
+            lines = [ln for ln in f.readlines() if ln.strip()]
+        with open(path, "a", encoding="utf-8") as f:
+            f.writelines(ln if ln.endswith("\n") else ln + "\n" for ln in lines)
+        os.remove(proc_path)
+        if lines:
+            _log.info("drain-mine: recovered %d orphaned entr%s from %s", len(lines),
+                      "y" if len(lines) == 1 else "ies", proc_path)
+        return len(lines)
+    except OSError:
+        _log.exception("drain-mine: could not recover orphaned batch %s", proc_path)
+        return 0
+
+
 async def _drain_pending_mines() -> int:
     """Replay queued /mine requests after a rebuild completes.
 
@@ -448,9 +474,10 @@ async def _drain_pending_mines() -> int:
     quarantined to a timestamped .failed-* file.
     """
     path = _pending_mines_path()
+    proc_path = path + ".processing"
+    _recover_orphaned_processing(path, proc_path)
     if not os.path.isfile(path):
         return 0
-    proc_path = path + ".processing"
     try:
         os.rename(path, proc_path)
     except OSError:
@@ -958,6 +985,16 @@ async def lifespan(app: FastAPI):
     # SIGKILL the cgroup. _internal_mine adds the proc on spawn and removes
     # it on completion via try/finally.
     app.state.active_mines = set()
+    # Queued (202) hook mines survive a restart on disk; nothing else would
+    # replay them until the next repair. Recover an interrupted batch and
+    # start the drainer if anything is waiting.
+    try:
+        _recover_orphaned_processing(_pending_mines_path(), _pending_mines_path() + ".processing")
+        if os.path.isfile(_pending_mines_path()):
+            _kick_mine_drain()
+            _log.info("startup: pending-mines queue present — background drainer started")
+    except Exception:
+        _log.exception("startup: pending-mines recovery failed (non-fatal)")
     try:
         from watcher import WatcherService, make_async_mine_fn, parse_watch_dirs
 
