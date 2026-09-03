@@ -430,6 +430,14 @@ async def _enqueue_pending_mine(payload: dict) -> None:
     await asyncio.to_thread(_append)
 
 
+# mempalace's palace flock is exclusive and non-blocking: a CLI mine that
+# finds it held prints this and exits non-zero. Seen from the drainer that is
+# contention with an external mine (sweep / manual), not a failed replay.
+_LOCK_HELD_MARKER = b"is held by PID"
+_LOCK_REQUEUE_MAX = 30  # ~ up to 30 * delay of waiting before giving up
+_LOCK_REQUEUE_DELAY_S = 20
+
+
 async def _drain_pending_mines() -> int:
     """Replay queued /mine requests after a rebuild completes.
 
@@ -449,6 +457,7 @@ async def _drain_pending_mines() -> int:
         return 0
     count = 0
     failed_lines: list[str] = []
+    requeue_lines: list[str] = []
     try:
         with open(proc_path, encoding="utf-8") as f:
             lines = [ln for ln in f.readlines() if ln.strip()]
@@ -543,6 +552,24 @@ async def _drain_pending_mines() -> int:
                             active_mines.discard(proc)
                 if proc.returncode == 0:
                     count += 1
+                elif _LOCK_HELD_MARKER in (stderr or b""):
+                    # An external CLI mine (a sweep, a manual `mempalace mine`)
+                    # holds the palace flock. That is contention, not failure:
+                    # put the entry back for the next drain pass instead of
+                    # quarantining it — otherwise every hook ingest that lands
+                    # during a sweep is silently lost.
+                    tries = int(entry.get("lock_retries", 0)) + 1
+                    if tries <= _LOCK_REQUEUE_MAX:
+                        entry["lock_retries"] = tries
+                        requeue_lines.append(json.dumps(entry))
+                        _log.info(
+                            "drain-mine: palace lock held by another process; requeued %s (try %d)",
+                            directory,
+                            tries,
+                        )
+                    else:
+                        _log.warning("drain-mine: giving up on %s after %d lock retries", directory, tries)
+                        failed_lines.append(line)
                 else:
                     _log.warning(
                         "drain-mine: replay returned %s for %s\n  stderr: %s",
@@ -559,6 +586,12 @@ async def _drain_pending_mines() -> int:
             with open(qpath, "w", encoding="utf-8") as f:
                 f.writelines(failed_lines)
             _log.warning("drain-mine: %d entries quarantined at %s", len(failed_lines), qpath)
+        if requeue_lines:
+            # Back onto the live queue (appends coexist with new /mine posts).
+            with open(path, "a", encoding="utf-8") as f:
+                for ln in requeue_lines:
+                    f.write(ln + "\n")
+            await asyncio.sleep(_LOCK_REQUEUE_DELAY_S)
         os.remove(proc_path)
     except Exception:
         _log.exception("drain-mine: read failed; leaving %s in place", proc_path)

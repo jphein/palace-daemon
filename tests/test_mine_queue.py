@@ -244,3 +244,69 @@ class TestMineablePath:
         from main import _is_mineable_path
 
         assert _is_mineable_path(tmp_path / "nope.jsonl") is False
+
+
+class TestDrainRequeuesOnLockContention(unittest.IsolatedAsyncioTestCase):
+    """A replay that fails only because another process holds the palace
+    flock is requeued for the next pass, not quarantined (a sweep running
+    while hooks post would otherwise silently drop every ingest)."""
+
+    async def asyncSetUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self._queue_path = os.path.join(self.tmp.name, "pending-mines.jsonl")
+        self._patches = [
+            patch.object(main, "_pending_mines_path", return_value=self._queue_path),
+            patch.object(main, "_translate_client_path", side_effect=lambda p: p),
+            patch("pathlib.Path.is_dir", return_value=True),
+            patch.object(main, "_LOCK_REQUEUE_DELAY_S", 0),
+        ]
+        for p in self._patches:
+            p.start()
+
+    async def asyncTearDown(self):
+        for p in self._patches:
+            p.stop()
+        self.tmp.cleanup()
+
+    async def test_lock_held_is_requeued_not_quarantined(self):
+        await main._enqueue_pending_mine({"dir": "/a", "wing": "wa", "mode": "convos"})
+
+        async def _spawn(*args, **kwargs):
+            proc = MagicMock()
+            proc.communicate = AsyncMock(
+                return_value=(b"", b"mempalace: palace /p is held by PID 42 (mine); wait for it")
+            )
+            proc.returncode = 1
+            return proc
+
+        with patch("asyncio.create_subprocess_exec", side_effect=_spawn):
+            drained = await main._drain_pending_mines()
+        self.assertEqual(drained, 0)
+        self.assertTrue(os.path.isfile(self._queue_path), "entry must be back on the live queue")
+        with open(self._queue_path) as f:
+            entry = json.loads(f.read().strip())
+        self.assertEqual(entry["lock_retries"], 1)
+        self.assertEqual(entry["payload"]["dir"], "/a")
+        failed = [n for n in os.listdir(self.tmp.name) if ".failed-" in n]
+        self.assertEqual(failed, [], "lock contention must not quarantine")
+
+    async def test_gives_up_after_max_retries(self):
+        await main._enqueue_pending_mine({"dir": "/a", "wing": "wa", "mode": "convos"})
+        # pre-set the retry counter at the ceiling
+        with open(self._queue_path) as f:
+            entry = json.loads(f.read().strip())
+        entry["lock_retries"] = main._LOCK_REQUEUE_MAX
+        with open(self._queue_path, "w") as f:
+            f.write(json.dumps(entry) + "\n")
+
+        async def _spawn(*args, **kwargs):
+            proc = MagicMock()
+            proc.communicate = AsyncMock(return_value=(b"", b"palace /p is held by PID 42"))
+            proc.returncode = 1
+            return proc
+
+        with patch("asyncio.create_subprocess_exec", side_effect=_spawn):
+            await main._drain_pending_mines()
+        self.assertFalse(os.path.isfile(self._queue_path))
+        failed = [n for n in os.listdir(self.tmp.name) if ".failed-" in n]
+        self.assertEqual(len(failed), 1, "exhausted retries are quarantined")
