@@ -310,3 +310,47 @@ class TestDrainRequeuesOnLockContention(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(os.path.isfile(self._queue_path))
         failed = [n for n in os.listdir(self.tmp.name) if ".failed-" in n]
         self.assertEqual(len(failed), 1, "exhausted retries are quarantined")
+
+
+class TestRecoverOrphanedProcessing(unittest.IsolatedAsyncioTestCase):
+    """An interrupted drain batch (.processing left behind by a restart) is
+    folded back into the live queue and drained, not stranded forever."""
+
+    async def asyncSetUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self._queue_path = os.path.join(self.tmp.name, "pending-mines.jsonl")
+        self._patches = [
+            patch.object(main, "_pending_mines_path", return_value=self._queue_path),
+            patch.object(main, "_translate_client_path", side_effect=lambda p: p),
+            patch("pathlib.Path.is_dir", return_value=True),
+        ]
+        for p in self._patches:
+            p.start()
+
+    async def asyncTearDown(self):
+        for p in self._patches:
+            p.stop()
+        self.tmp.cleanup()
+
+    async def test_orphaned_batch_is_recovered_and_drained(self):
+        orphan = self._queue_path + ".processing"
+        with open(orphan, "w") as f:
+            f.write(json.dumps({"payload": {"dir": "/a", "wing": "wa", "mode": "convos"}}) + "\n")
+
+        async def _spawn(*args, **kwargs):
+            proc = MagicMock()
+            proc.communicate = AsyncMock(return_value=(b"ok", b""))
+            proc.returncode = 0
+            return proc
+
+        with patch("asyncio.create_subprocess_exec", side_effect=_spawn) as spawn:
+            drained = await main._drain_pending_mines()
+        self.assertEqual(drained, 1)
+        spawn.assert_called_once()
+        self.assertFalse(os.path.exists(orphan))
+        self.assertFalse(os.path.exists(self._queue_path))
+
+    def test_recover_returns_zero_when_nothing_orphaned(self):
+        self.assertEqual(
+            main._recover_orphaned_processing(self._queue_path, self._queue_path + ".processing"), 0
+        )
