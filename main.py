@@ -565,6 +565,38 @@ async def _drain_pending_mines() -> int:
     return count
 
 
+_mine_drain_task: "asyncio.Task | None" = None
+
+
+def _kick_mine_drain() -> None:
+    """Ensure one background task is draining the pending-mines queue.
+
+    Background /mine requests append to the queue and return 202; this
+    starts a drainer if none is running. The drainer loops because entries
+    that arrive while a batch is processing land in a fresh queue file
+    (rename-then-read), and stops when the queue is empty. Serialised on
+    _mine_sem like every other mine, so it never races a live /mine.
+    """
+    global _mine_drain_task
+    if _mine_drain_task is not None and not _mine_drain_task.done():
+        return
+
+    async def _loop():
+        try:
+            for _ in range(10_000):  # bound: never spin forever on a stuck queue
+                if _repair_state.get("in_progress") and _repair_state.get("mode") == "rebuild":
+                    return  # the post-repair drain takes over
+                drained = await _drain_pending_mines()
+                if not os.path.isfile(_pending_mines_path()):
+                    return
+                if drained == 0 and not os.path.isfile(_pending_mines_path()):
+                    return
+        except Exception:
+            _log.exception("mine-drain: background drainer raised")
+
+    _mine_drain_task = asyncio.get_running_loop().create_task(_loop())
+
+
 async def _drain_pending_writes() -> int:
     """Replay queued silent-saves after a rebuild completes.
 
@@ -2670,6 +2702,31 @@ async def mine(
                 "when repair completes."
             ),
         }
+
+    if body.background:
+        # Hooks: queue + 202 now, drain serially in the background. The
+        # blocking path below made the hooks' 30s timeout fire on every real
+        # mine, journal a replay, and run the mine twice while the daemon
+        # finished the original (mempalace#426, #233).
+        await _enqueue_pending_mine({
+            "dir": raw_dir,
+            "wing": wing,
+            "mode": mode,
+            "extract": extract,
+            "limit": limit,
+        })
+        _kick_mine_drain()
+        return JSONResponse(
+            status_code=202,
+            content={
+                "queued": True,
+                "reason": "background",
+                "dir": raw_dir,
+                "wing": wing,
+                "mode": mode,
+                "systemMessage": "Mine queued — running in the background on the palace host.",
+            },
+        )
 
     mempalace_bin = os.path.join(os.path.dirname(sys.executable), "mempalace")
     cmd = [mempalace_bin, "mine", directory, "--mode", mode, "--wing", wing]

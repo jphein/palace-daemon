@@ -148,6 +148,14 @@ class MineBody(BaseModel):
     mode: str = Field("convos", description="Mine mode.")
     extract: "str | None" = Field(None, description="Optional extract policy.")
     limit: "int | None" = Field(None, ge=1, description="Optional drawer-count cap.")
+    background: bool = Field(
+        False,
+        description=(
+            "Queue the mine and answer 202 immediately instead of blocking until the "
+            "subprocess finishes. Hooks use this: a blocking /mine made the 30s hook "
+            "timeout fire on every real mine, journal a replay, and run the mine twice."
+        ),
+    )
 
     @field_validator("dir")
     @classmethod
