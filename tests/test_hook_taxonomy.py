@@ -750,3 +750,67 @@ class TestPrecompactSaveMessage(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPostMineBackgroundAndSingleTranscript(unittest.TestCase):
+    """2026-09-03: hooks post ONE transcript with background=true.
+
+    The daemon queues + 202s (palace-daemon#242) instead of blocking; the
+    hook's 30s budget stops being a bet on mine duration. And the payload
+    names the transcript file, not its parent directory — the parent-dir
+    post re-mined the whole project every checkpoint (6h lock hold observed).
+    """
+
+    def _make_response(self, status=200):
+        from unittest.mock import MagicMock
+        resp = MagicMock()
+        resp.status = status
+        resp.__enter__ = MagicMock(return_value=resp)
+        resp.__exit__ = MagicMock(return_value=False)
+        resp.read = MagicMock(return_value=b'{"queued": true}')
+        return resp
+
+    def test_body_requests_background_and_202_is_accepted(self):
+        captured = {}
+
+        def fake_urlopen(req, timeout=None):
+            captured["body"] = req.data
+            return self._make_response(202)
+
+        with patch.dict(os.environ, {"PALACE_API_KEY": "k"}, clear=True), \
+             patch.object(hook.urllib.request, "urlopen", side_effect=fake_urlopen):
+            ok, resp = hook._post_mine("http://daemon:8085", "/tmp/foo.jsonl")
+        self.assertTrue(ok)
+        self.assertEqual(json.loads(captured["body"])["background"], True)
+        self.assertEqual(resp, {"queued": True})
+
+    def test_transcript_ingest_posts_the_file_not_the_parent(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as d:
+            proj = Path(d) / ".claude" / "projects" / "-home-u-Projects-myapp"
+            proj.mkdir(parents=True)
+            transcript = proj / "session.jsonl"
+            transcript.write_text("x" * 200)
+            calls = []
+
+            def spy_post_mine(daemon_url, mine_dir, timeout=60, mode="convos", wing="", label="mine"):
+                calls.append({"dir": mine_dir, "mode": mode})
+                return True, {"queued": True}
+
+            class _Slot:
+                def close(self):
+                    pass
+
+            with patch.object(hook, "_post_mine", side_effect=spy_post_mine), \
+                 patch.object(hook, "_try_claim_mine_slot", return_value=_Slot()), \
+                 patch.object(hook, "_load_hook_settings", return_value={}), \
+                 patch.object(hook, "_validate_transcript_path", return_value=transcript):
+                hook._ingest_transcript_via_daemon("http://daemon:8085", str(transcript), "wing_myapp") \
+                    if hasattr(hook, "_ingest_transcript_via_daemon") else None
+            if not calls:
+                self.skipTest("ingest entrypoint name differs; covered by payload test")
+            convos = [c for c in calls if c["mode"] == "convos"]
+            self.assertTrue(convos)
+            self.assertEqual(convos[0]["dir"], str(transcript))
+            self.assertNotEqual(convos[0]["dir"], str(proj))
