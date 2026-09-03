@@ -16,6 +16,7 @@ Run with::
     python -m unittest tests.test_mine_backend_aware -v
 """
 import asyncio
+import json
 import os
 import sys
 import tempfile
@@ -223,3 +224,103 @@ class TestMineBackendAware(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestMineBackground(unittest.IsolatedAsyncioTestCase):
+    """POST /mine {background: true} queues + 202s instead of blocking.
+
+    The blocking path made the hooks' 30s timeout fire on every real mine,
+    journal a replay, and run the mine twice (mempalace#426, #233).
+    """
+
+    async def asyncSetUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = self.tmp.name
+        self.queue = os.path.join(self.tmp.name, "pending-mines.jsonl")
+        self._patches = [
+            patch.object(main, "_translate_client_path", side_effect=lambda p: p),
+            patch.object(main, "_check_auth", side_effect=lambda *_a, **_k: None),
+            patch.object(main, "_pending_mines_path", return_value=self.queue),
+        ]
+        for p in self._patches:
+            p.start()
+        self._orig_repair = dict(main._repair_state)
+        main._repair_state["in_progress"] = False
+        main._mine_drain_task = None
+
+    async def asyncTearDown(self):
+        task = main._mine_drain_task
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        main._mine_drain_task = None
+        for p in self._patches:
+            p.stop()
+        main._repair_state.clear()
+        main._repair_state.update(self._orig_repair)
+        self.tmp.cleanup()
+
+    def _request_and_body(self, **body_overrides):
+        from search_models import MineBody
+
+        body = {"dir": self.dir, "wing": "general", "mode": "convos", "background": True}
+        body.update(body_overrides)
+        req = MagicMock()
+        req.json = AsyncMock(return_value=body)
+        req.app.state.active_mines = set()
+        return req, MineBody(**body)
+
+    async def test_background_returns_202_queues_and_drains(self):
+        fake_cfg = MagicMock(backend="postgres", palace_path="/tmp/palace")
+        with patch.object(main._mp, "_config", fake_cfg), \
+             patch("asyncio.create_subprocess_exec",
+                   side_effect=_fake_subprocess_factory()) as spawn:
+            req, body = self._request_and_body(wing="openwrt")
+            result = await main.mine(req, body, x_api_key=None)
+            # 202 returned before any subprocess ran
+            self.assertEqual(result.status_code, 202)
+            payload = json.loads(result.body)
+            self.assertTrue(payload["queued"])
+            self.assertEqual(payload["reason"], "background")
+            self.assertEqual(payload["wing"], "openwrt")
+            # the drainer task exists and, once awaited, replays the entry
+            self.assertIsNotNone(main._mine_drain_task)
+            await asyncio.wait_for(main._mine_drain_task, timeout=5)
+            spawn.assert_called_once()
+            cmd = spawn.call_args.args
+            self.assertIn(self.dir, cmd)
+            self.assertIn("openwrt", cmd)
+        self.assertFalse(os.path.exists(self.queue), "queue drained")
+
+    async def test_kick_drain_is_idempotent(self):
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_drain():
+            started.set()
+            await release.wait()
+            return 0
+
+        with patch.object(main, "_drain_pending_mines", side_effect=slow_drain):
+            main._kick_mine_drain()
+            first = main._mine_drain_task
+            await started.wait()
+            main._kick_mine_drain()
+            self.assertIs(main._mine_drain_task, first, "second kick must not start a new task")
+            release.set()
+            await asyncio.wait_for(first, timeout=5)
+
+    async def test_blocking_default_unchanged(self):
+        fake_cfg = MagicMock(backend="postgres", palace_path="/tmp/palace")
+        with patch.object(main._mp, "_config", fake_cfg), \
+             patch("asyncio.create_subprocess_exec",
+                   side_effect=_fake_subprocess_factory()) as spawn:
+            req, body = self._request_and_body(background=False)
+            result = await main.mine(req, body, x_api_key=None)
+        self.assertIsInstance(result, dict)
+        self.assertEqual(result["returncode"], 0)
+        spawn.assert_called_once()
+        self.assertIsNone(main._mine_drain_task)
