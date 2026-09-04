@@ -1228,10 +1228,20 @@ async def mcp_proxy(request: Request, x_api_key: str | None = Header(default=Non
     # Fast-intercepts that have an upstream MCP equivalent — failures fall
     # through to the slow path so behaviour matches the upstream MCP server.
     fast_fn = None
-    if PALACE_MCP_FAST_INTERCEPT and tool in ("mempalace_status", "mempalace_kg_stats"):
+    if PALACE_MCP_FAST_INTERCEPT and tool in (
+        "mempalace_status",
+        "mempalace_kg_stats",
+        "mempalace_list_wings",
+        "mempalace_get_taxonomy",
+    ) and not arguments:
+        # list_wings / get_taxonomy take no arguments; the MCP tools sweep the
+        # whole drawer set and time out at 700K+ drawers (#239). Only intercept
+        # the no-argument call so any future filtered variant falls through.
         fast_fn = {
             "mempalace_status": _fast_mcp_status_payload,
             "mempalace_kg_stats": _fast_mcp_kg_stats_payload,
+            "mempalace_list_wings": _fast_mcp_list_wings_payload,
+            "mempalace_get_taxonomy": _fast_mcp_get_taxonomy_payload,
         }[tool]
     elif (
         PALACE_MCP_FAST_INTERCEPT
@@ -1885,7 +1895,9 @@ async def status_fast(x_api_key: str | None = Header(default=None)):
 # unit tests (test_mcp_fast_intercept.py) without test edits.
 from fast_intercept import (  # noqa: E402
     fast_list_payload as _fast_list_payload,
+    fast_mcp_get_taxonomy_payload as _fast_mcp_get_taxonomy_payload,
     fast_mcp_kg_stats_payload as _fast_mcp_kg_stats_payload,
+    fast_mcp_list_wings_payload as _fast_mcp_list_wings_payload,
     fast_mcp_status_payload as _fast_mcp_status_payload,
 )
 
