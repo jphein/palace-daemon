@@ -354,3 +354,43 @@ class TestRecoverOrphanedProcessing(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             main._recover_orphaned_processing(self._queue_path, self._queue_path + ".processing"), 0
         )
+
+
+class TestMineStatusEndpoint(unittest.IsolatedAsyncioTestCase):
+    """GET /mine/status reports queue depth, processing batch, active mines, drainer state."""
+
+    async def asyncSetUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self._queue_path = os.path.join(self.tmp.name, "pending-mines.jsonl")
+        self._patches = [
+            patch.object(main, "_pending_mines_path", return_value=self._queue_path),
+            patch.object(main, "_check_auth", side_effect=lambda *_a, **_k: None),
+        ]
+        for p in self._patches:
+            p.start()
+        main._mine_drain_task = None
+
+    async def asyncTearDown(self):
+        for p in self._patches:
+            p.stop()
+        self.tmp.cleanup()
+
+    async def test_reports_counts_and_peek(self):
+        await main._enqueue_pending_mine({"dir": "/a.jsonl", "wing": "wa", "mode": "convos"})
+        await main._enqueue_pending_mine({"dir": "/b.jsonl", "wing": "wb", "mode": "convos"})
+        with open(self._queue_path + ".processing", "w") as f:
+            f.write(json.dumps({"payload": {"dir": "/c.jsonl", "wing": "wc", "mode": "convos"}}) + "\n")
+        main.app.state.active_mines = {object()}
+        try:
+            out = await main.mine_status(x_api_key=None)
+        finally:
+            main.app.state.active_mines = set()
+        self.assertEqual(out["queued"], 2)
+        self.assertEqual(out["processing"], 1)
+        self.assertEqual(out["active_mines"], 1)
+        self.assertFalse(out["drainer_running"])
+        self.assertEqual([n["dir"] for n in out["next"]], ["/a.jsonl", "/b.jsonl", "/c.jsonl"])
+
+    async def test_empty_queue(self):
+        out = await main.mine_status(x_api_key=None)
+        self.assertEqual((out["queued"], out["processing"], out["next"]), (0, 0, []))

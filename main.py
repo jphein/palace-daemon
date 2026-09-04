@@ -1813,6 +1813,58 @@ from daemon_tools import (  # noqa: E402
 )
 
 
+@app.get("/mine/status")
+async def mine_status(x_api_key: str | None = Header(default=None)):
+    """Ingest queue status — so hooks and agents never have to guess (#233).
+
+    Reports the background mine queue (live + in-processing entries), the
+    currently running mine subprocesses, whether the drainer task is alive,
+    and whether a repair is holding mines back. Cheap: two line counts and
+    a few attribute reads; no palace access.
+    """
+    _check_auth(x_api_key)
+    path = _pending_mines_path()
+    proc_path = path + ".processing"
+
+    def _count(p: str) -> int:
+        try:
+            with open(p, encoding="utf-8") as f:
+                return sum(1 for ln in f if ln.strip())
+        except OSError:
+            return 0
+
+    def _peek(p: str, limit: int = 5) -> list:
+        out = []
+        try:
+            with open(p, encoding="utf-8") as f:
+                for ln in f:
+                    if not ln.strip():
+                        continue
+                    try:
+                        payload = json.loads(ln).get("payload", {})
+                    except (ValueError, AttributeError):
+                        continue
+                    out.append({k: payload.get(k) for k in ("dir", "wing", "mode")})
+                    if len(out) >= limit:
+                        break
+        except OSError:
+            pass
+        return out
+
+    live = _count(path)
+    processing = _count(proc_path)
+    active = getattr(app.state, "active_mines", None)
+    task = _mine_drain_task
+    return {
+        "queued": live,
+        "processing": processing,
+        "active_mines": len(active) if active is not None else 0,
+        "drainer_running": bool(task is not None and not task.done()),
+        "repair_in_progress": bool(_repair_state.get("in_progress")),
+        "next": _peek(path) + _peek(proc_path),
+    }
+
+
 @app.get("/status/fast")
 async def status_fast(x_api_key: str | None = Header(default=None)):
     """Fast palace status via direct SQL — no MCP, no AGE, no locks."""
