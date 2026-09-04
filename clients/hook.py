@@ -899,7 +899,12 @@ def _post_mine(daemon_url: str, mine_dir: str, timeout: int = 60,
     precompact MEMPAL_DIR mine) and an unlabeled failure line next to an
     unrelated summary reads as a contradiction (#382).
     """
-    body = {"dir": mine_dir, "mode": mode}
+    # background=True: the daemon queues the mine and answers 202 at once
+    # (palace-daemon#242). Without it /mine blocked until the subprocess
+    # finished, this hook's 30s budget expired on every real mine, a replay
+    # was journaled, and the daemon finished the original anyway — every
+    # long mine ran twice (mempalace#426). Older daemons ignore the field.
+    body = {"dir": mine_dir, "mode": mode, "background": True}
     if wing:
         body["wing"] = wing
     payload = json.dumps(body).encode()
@@ -911,7 +916,7 @@ def _post_mine(daemon_url: str, mine_dir: str, timeout: int = 60,
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            if resp.status != 200:
+            if resp.status not in (200, 202):
                 return False, {"error": f"HTTP {resp.status}"}
             try:
                 body = json.loads(resp.read().decode("utf-8"))
@@ -1382,7 +1387,12 @@ def _ingest_transcript_via_daemon(daemon_url: str, transcript_path: str, wing: s
     if not settings.get("ingest_transcripts", True):
         return False
 
-    mine_dir = str(path.parent)
+    # Mine THIS transcript, not its parent directory. Posting the parent
+    # re-mined every session in the project on every checkpoint — one such
+    # mine measured 6h holding the palace write lock while three sessions
+    # were live (mempalace#414/#426). The daemon accepts a single .jsonl
+    # (palace-daemon#241 _is_mineable_path); convo_miner always has.
+    mine_dir = str(path)
 
     # Per-target dedup: if another hook process is currently inside /mine
     # for the same (dir, mode, wing), skip rather than queue a redundant
