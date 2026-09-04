@@ -53,7 +53,29 @@ except ImportError as _hnsw_err:
     )
     sys.exit(1)
 
-import mempalace.mcp_server as _mp
+# The palace path must be in the environment BEFORE mempalace.mcp_server is
+# imported: that module builds its MempalaceConfig at import time, and every
+# path the daemon derives from it (mine queue, locks, hallways/tunnels files)
+# is fixed from then on. Until 2026-09-03 this worked by accident — mcp_server's
+# module-scope parser scraped `--palace` out of THIS process's argv. mempalace
+# #441 stopped non-entrypoint importers doing that, the daemon silently fell
+# back to ~/.mempalace/palace, and its whole mine queue moved paths across a
+# restart (140 queued hook mines orphaned). Resolve it explicitly, here.
+def _palace_path_from_argv(argv, env):
+    """--palace X | --palace=X from argv, else PALACE_PATH / MEMPALACE_PALACE_PATH from env, else None."""
+    for i, a in enumerate(argv):
+        if a == "--palace" and i + 1 < len(argv):
+            return argv[i + 1]
+        if a.startswith("--palace="):
+            return a.split("=", 1)[1]
+    return env.get("MEMPALACE_PALACE_PATH") or env.get("PALACE_PATH") or None
+
+
+_early_palace = _palace_path_from_argv(sys.argv[1:], os.environ)
+if _early_palace:
+    os.environ["MEMPALACE_PALACE_PATH"] = _early_palace
+
+import mempalace.mcp_server as _mp  # noqa: E402  (after the palace-path export above)
 from mempalace import repair as _mp_repair
 from mempalace.backends.chroma import quarantine_stale_hnsw
 
@@ -3380,7 +3402,10 @@ def main():
         sys.exit(1)
 
     if args.palace:
-        os.environ["MEMPALACE_PALACE"] = args.palace
+        # MEMPALACE_PALACE_PATH is the variable mempalace actually reads
+        # (MEMPALACE_PALACE never was). The early export above already set
+        # it for the import; keep them consistent for anything spawned later.
+        os.environ["MEMPALACE_PALACE_PATH"] = args.palace
     if args.api_key:
         os.environ["PALACE_API_KEY"] = args.api_key
 
