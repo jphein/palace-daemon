@@ -82,6 +82,49 @@ def fast_status_payload() -> dict:
     return {"total_drawers": total, "wings": wings, "rooms": rooms}
 
 
+def fast_mcp_list_wings_payload() -> dict:
+    """``tool_list_wings`` shape via direct SQL (#239).
+
+    The MCP tool sweeps the whole drawer set to build per-wing counts, which
+    at 700K+ drawers exceeds the /mcp tool timeout. This is the ``wings`` half
+    of the counts fast_status_payload already computes.
+    """
+    import main  # lazy — mirrors fast_mcp_status_payload's re-export contract
+
+    return {"wings": main._fast_status_payload().get("wings", {})}
+
+
+def fast_mcp_get_taxonomy_payload() -> dict:
+    """``tool_get_taxonomy`` shape (per-wing × per-room counts) via direct SQL (#239)."""
+    from db_errors import record_db_error
+    from postgres import postgres_dsn
+
+    dsn = postgres_dsn()
+    if not dsn:
+        raise RuntimeError("postgres backend not configured")
+    import psycopg2
+
+    try:
+        conn = psycopg2.connect(dsn, connect_timeout=3)
+    except psycopg2.OperationalError as e:
+        record_db_error(e)
+        raise
+    taxonomy: dict = {}
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("SET LOCAL statement_timeout = '5s'")
+                cur.execute(
+                    "SELECT wing, room, count(*) FROM mempalace_drawers "
+                    "WHERE wing IS NOT NULL GROUP BY wing, room ORDER BY wing, count(*) DESC"
+                )
+                for wing, room, n in cur.fetchall():
+                    taxonomy.setdefault(wing, {})[room if room is not None else ""] = n
+    finally:
+        conn.close()
+    return {"taxonomy": taxonomy}
+
+
 def fast_mcp_status_payload() -> dict:
     """``tool_status`` shape via the direct-SQL fast path.
 

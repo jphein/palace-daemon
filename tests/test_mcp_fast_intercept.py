@@ -255,3 +255,41 @@ class TestMcpProxyInterception(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestFastInterceptWingsTaxonomy(unittest.TestCase):
+    """#239: list_wings / get_taxonomy served by direct SQL, not a full sweep."""
+
+    def test_list_wings_shape(self):
+        with patch.object(main, "_fast_status_payload",
+                          return_value={"total_drawers": 5, "wings": {"a": 3, "b": 2}, "rooms": {}}):
+            payload = main._fast_mcp_list_wings_payload()
+        self.assertEqual(payload, {"wings": {"a": 3, "b": 2}})
+
+    def test_get_taxonomy_shape(self):
+        import sys
+        import types
+
+        import fast_intercept
+
+        class _Cur:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def execute(self, *a): pass
+            def fetchall(self):
+                return [("a", "problems", 3), ("a", "references", 1), ("b", None, 2)]
+        class _Conn:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def cursor(self): return _Cur()
+            def close(self): pass
+        # psycopg2 is present in the production/CI daemon venv but not in this
+        # minimal test env; inject a stub so the direct-SQL path is exercised.
+        fake = types.ModuleType("psycopg2")
+        fake.OperationalError = type("OperationalError", (Exception,), {})
+        fake.connect = lambda *a, **k: _Conn()
+        with patch("postgres.postgres_dsn", return_value="postgresql://x"), \
+             patch.dict(sys.modules, {"psycopg2": fake}):
+            payload = fast_intercept.fast_mcp_get_taxonomy_payload()
+        assert payload["taxonomy"]["a"] == {"problems": 3, "references": 1}
+        assert payload["taxonomy"]["b"] == {"": 2}
